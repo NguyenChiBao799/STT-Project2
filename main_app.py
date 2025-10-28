@@ -1,26 +1,70 @@
 # main_app.py
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog 
 import time
 import os
 import threading
 import json
 import uuid
 import random
+import asyncio 
 from datetime import datetime as _dt
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, AsyncGenerator, Tuple, Any 
 import traceback 
+import wave 
 
-# ⚠️ Import DialogManager
-from dialog_manager import DialogManager
-from voice_io_handler import VoiceIOHandler
+# ==================== MOCK DEPENDENCIES (Cho tính Robust) =====================
+# Các class này được dùng nếu các file .py tương ứng không tồn tại.
+# Chúng cần trả về True cho is_ready() để cho phép logic RTC chạy.
 
-# --- THƯ VIỆN NGOÀI ---
+class DialogManager: 
+    def __init__(self, *args, **kwargs): self._is_ready = True
+    def is_ready(self): return self._is_ready
+    def get_initial_error(self): return "MOCK DM: Sẵn Sàng"
+    def terminate(self): pass
+
+class VoiceIOHandler:
+    def __init__(self, log_callback, audio_file): 
+        self.stop_event = threading.Event()
+        self._is_ready = True
+    def is_ready(self): return self._is_ready
+    def get_initial_error(self): return "MOCK IO: Sẵn Sàng"
+    def terminate(self): pass
+
+# ⚠️ Import DialogManager và VoiceIOHandler
+try:
+    from dialog_manager import DialogManager
+    from voice_io_handler import VoiceIOHandler
+    print("✅ [App] Đã tìm thấy DialogManager và VoiceIOHandler.")
+except ImportError:
+    # Retain the MOCK classes defined above
+    print("⚠️ [App] WARNING: dialog_manager.py or voice_io_handler.py not found. Using Mock classes.")
+
+
+# THÊM: Import RTCStreamProcessor và các hằng số từ module RTC
+try:
+    from rtc_integration_layer import RTCStreamProcessor, RECORDING_DIR, SAMPLE_RATE, CHANNELS, CHUNK_SIZE
+    print("✅ [App] Đã tìm thấy RTCStreamProcessor.")
+except ImportError:
+    # Fallback/Mock cho RTCProcessor
+    class RTCStreamProcessor:
+        def __init__(self, log_callback): self.log = log_callback
+        async def handle_rtc_session(self, stream, session_id): 
+            self.log(f"MOCK RTC: Handling session {session_id}")
+            yield (False, {"user_text": "MOCK ASR Transcript", "bot_text": "MOCK Bot Response"})
+            await asyncio.sleep(0.5) 
+            yield (True, b"MOCK_TTS_RESPONSE")
+    RECORDING_DIR = Path("rtc_recordings")
+    SAMPLE_RATE = 16000 
+    CHUNK_SIZE = 1024   
+    CHANNELS = 1        
+    print("❌ [App] RTCStreamProcessor not found. Using Mock.")
+    
+# --- THƯ VIỆN NGOÀI (Prometheus) ---
 try:
     from prometheus_client import start_http_server, Counter as PromCounter, Gauge
-    # Sử dụng config_db nếu có, hoặc dùng fallback
     try:
          from config_db import PROMETHEUS_PORT
     except ImportError:
@@ -34,18 +78,17 @@ except Exception:
         def set(self, v): pass
     REQUEST_COUNTER = ERROR_COUNTER = RESPONSE_TIME_GAUGE = _MockMetric()
 
-# ==================== PHẦN I: HÀM HỖ TRỢ & IMPORTS ====================
+# ==================== PHẦN I: HÀM HỖ TRỢ & HẰNG SỐ ====================
 
 # Cấu hình file/folder (Sử dụng config_db cho các hằng số)
 try:
     from config_db import AUDIO_FILE, TEMP_TTS_FILE, CONFIG_FILE, LOG_FILE_PATH, MOCK_STATS, SCENARIOS_CONFIG
-    # Chuyển Path object
+    from pathlib import Path 
     AUDIO_FILE = Path(AUDIO_FILE)
     TEMP_TTS_FILE = Path(TEMP_TTS_FILE)
     CONFIG_FILE = Path(CONFIG_FILE)
     LOG_FILE_PATH = Path(LOG_FILE_PATH)
 except ImportError:
-    # Fallback paths/configs if config_db fails
     BASE_DIR = Path(__file__).parent
     TEMP_FOLDER = BASE_DIR / "temp"
     LOG_FOLDER = BASE_DIR / "logs"
@@ -53,12 +96,8 @@ except ImportError:
     TEMP_TTS_FILE = TEMP_FOLDER / "tts_response.wav"
     CONFIG_FILE = BASE_DIR / "config.json"
     LOG_FILE_PATH = LOG_FOLDER / "app_log.txt"
-    MOCK_STATS = {
-        "total_requests": 1000, "conversion_rate": 0.1, 
-        "products_mentioned": {"Product X": 200, "Product Y": 150},
-        "sales_data": [{"date": "2025-01-01", "sales": 10000000, "conversion_rate": 0.1}]
-    }
-    SCENARIOS_CONFIG = {"intents": [{"intent_name": "query_weather", "responses": ["Fallback weather response."], "products": []}]}
+    MOCK_STATS = {}
+    SCENARIOS_CONFIG = {}
     print("⚠️ [IO] Failed to import paths/config from config_db, using fallback paths.")
 
 
@@ -97,8 +136,7 @@ ctk.set_default_color_theme("blue")
 class App(ctk.CTk):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # ✅ Đổi tên tiêu đề ứng dụng
-        self.title("Trợ Lý Bán Hàng AI - Boo Boo")
+        self.title("Trợ Lý Bán Hàng AI Boo Boo")
         self.geometry("1000x700")
         self.grid_columnconfigure(0, weight=0) 
         self.grid_columnconfigure(1, weight=1) 
@@ -106,8 +144,9 @@ class App(ctk.CTk):
 
         self.dm: Optional[DialogManager] = None
         self.voice_io: Optional[VoiceIOHandler] = None
+        self.rtc_processor: Optional[RTCStreamProcessor] = None 
         self.dm_initialized = False
-
+        
         # State variables
         self.api_key_var = tk.StringVar(value="")
         self.audio_device_var = tk.StringVar(value="Default")
@@ -116,11 +155,10 @@ class App(ctk.CTk):
         self.is_speaking = False
         self.rec_start_time = 0.0
         
-        # Stop processing event and thread reference
         self.process_stop_event = threading.Event() 
         self.processing_thread: Optional[threading.Thread] = None 
-        
-        # Scenario management data
+        self.mic_stream = None # Lưu trữ luồng mic async
+
         self.scenario_intents = SCENARIOS_CONFIG.get("intents", [])
         self.selected_intent_var = tk.StringVar(value=self.scenario_intents[0]["intent_name"] if self.scenario_intents else "")
 
@@ -130,12 +168,13 @@ class App(ctk.CTk):
         threading.Thread(target=self._initialize_core_modules, daemon=True).start()
         self._update_ui_loop() 
 
+    # ... (các hàm UI _create_ui, log, _save_ui_config, _load_ui_config giữ nguyên) ...
     def _create_ui(self):
         # --- Left Panel: Controls & Status ---
         self.left_panel = ctk.CTkFrame(self, width=300, corner_radius=0)
         self.left_panel.grid(row=0, column=0, rowspan=2, sticky="nsew")
         self.left_panel.grid_columnconfigure(0, weight=1)
-        self.left_panel.grid_rowconfigure(8, weight=1) # Log box
+        self.left_panel.grid_rowconfigure(9, weight=1) 
 
         ctk.CTkLabel(self.left_panel, text="Voice AI Control Panel", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
 
@@ -149,42 +188,57 @@ class App(ctk.CTk):
         self.button_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
         self.button_frame.columnconfigure((0, 1), weight=1)
 
-        self.record_button = ctk.CTkButton(self.button_frame, text="🔴 Start Recording", command=self.start_recording_command)
+        self.record_button = ctk.CTkButton(self.button_frame, text="🔴 Ghi âm (RTC Stream)", command=self.start_recording_command)
         self.record_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
-        self.stop_button = ctk.CTkButton(self.button_frame, text="⏹️ Stop Recording", command=self.stop_recording_command, state="disabled")
+        self.stop_button = ctk.CTkButton(self.button_frame, text="⏹️ Dừng & Xử lý (RTC Stream)", command=self.stop_recording_command, state="disabled")
         self.stop_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         
         # Stop Processing Button
         self.stop_process_button = ctk.CTkButton(self.button_frame, text="🛑 Ngừng Xử Lý", command=self.stop_processing_command, fg_color="red", hover_color="#800000", state="disabled")
         self.stop_process_button.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
-        # Status
-        self.status_label = ctk.CTkLabel(self.left_panel, text="Trạng Thái: ⚪ Chưa Khởi Tạo", fg_color="gray", corner_radius=6)
-        self.status_label.grid(row=4, column=0, padx=20, pady=5, sticky="ew")
+        # Nút Tải lên
+        self.rtc_button_frame = ctk.CTkFrame(self.left_panel)
+        self.rtc_button_frame.grid(row=4, column=0, padx=20, pady=10, sticky="ew")
+        self.rtc_button_frame.columnconfigure(0, weight=1)
         
-        # Progress & Duration
+        self.upload_button = ctk.CTkButton(
+            self.rtc_button_frame, 
+            text="📤 Tải file âm thanh", 
+            command=self.upload_audio_file,
+            fg_color="darkblue",
+            hover_color="#00008B"
+        )
+        self.upload_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+
+        # Status (row 5)
+        self.status_label = ctk.CTkLabel(self.left_panel, text="Trạng Thái: ⚪ Chưa Khởi Tạo", fg_color="gray", corner_radius=6)
+        self.status_label.grid(row=5, column=0, padx=20, pady=5, sticky="ew")
+        
+        # Progress & Duration (row 6, 7)
         self.progress_bar = ctk.CTkProgressBar(self.left_panel, orientation="horizontal", mode="determinate")
-        self.progress_bar.grid(row=5, column=0, padx=20, pady=(5, 0), sticky="ew")
+        self.progress_bar.grid(row=6, column=0, padx=20, pady=(5, 0), sticky="ew")
         self.progress_bar.set(0.0)
         self.duration_label = ctk.CTkLabel(self.left_panel, text="Duration: 0.00s")
-        self.duration_label.grid(row=6, column=0, padx=20, pady=(0, 5), sticky="w")
+        self.duration_label.grid(row=7, column=0, padx=20, pady=(0, 5), sticky="w")
 
-        # Log Box
-        ctk.CTkLabel(self.left_panel, text="Log Output:").grid(row=7, column=0, padx=20, pady=(10, 0), sticky="w")
+        # Log Box (row 8, 9)
+        ctk.CTkLabel(self.left_panel, text="Log Output:").grid(row=8, column=0, padx=20, pady=(10, 0), sticky="w")
         self.log_textbox = ctk.CTkTextbox(self.left_panel, height=200)
-        self.log_textbox.grid(row=8, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        self.log_textbox.grid(row=9, column=0, padx=20, pady=(0, 20), sticky="nsew")
         self.log_textbox.configure(state="disabled")
 
-        # --- Right Panel: Chat & Tabs ---
+        # --- Right Panel: Chat ---
         self.right_panel = ctk.CTkFrame(self, corner_radius=0)
         self.right_panel.grid(row=0, column=1, rowspan=2, sticky="nsew")
         self.right_panel.grid_columnconfigure(0, weight=1)
-        self.right_panel.grid_rowconfigure(0, weight=1) # Chat box gets more space
+        self.right_panel.grid_rowconfigure(0, weight=1) 
 
         # 1. Chat/ASR Box
         self.chat_frame = ctk.CTkFrame(self.right_panel)
-        self.chat_frame.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="nsew")
+        self.chat_frame.grid(row=0, column=0, padx=10, pady=(10, 10), sticky="nsew")
         self.chat_frame.grid_columnconfigure(0, weight=1)
         self.chat_frame.grid_rowconfigure(1, weight=1)
 
@@ -195,168 +249,7 @@ class App(ctk.CTk):
         self.chat_textbox.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.chat_textbox.configure(state="disabled")
 
-        # 2. Tab View for Management/Stats
-        self.tab_view = ctk.CTkTabview(self.right_panel, height=350)
-        self.tab_view.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
-        
-        # Create tabs
-        self.stats_tab = self.tab_view.add("📊 Thống Kê")
-        self.scenario_tab = self.tab_view.add("⚙️ Kịch Bản")
-        self.sales_tab = self.tab_view.add("💰 Báo Cáo Doanh Số")
-        
-        self._create_stats_tab(self.stats_tab)
-        self._create_scenario_tab(self.scenario_tab)
-        self._create_sales_tab(self.sales_tab)
-
-
-    # -------------------- LOGIC CHO CÁC TAB --------------------
-
-    def _create_stats_tab(self, tab):
-        tab.grid_columnconfigure(0, weight=1)
-        
-        ctk.CTkLabel(tab, text="Thống Kê Tổng Quan (Mock Data)", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 10), sticky="w")
-        
-        # 1. Tỷ lệ chuyển đổi
-        frame_rate = ctk.CTkFrame(tab)
-        frame_rate.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        rate = MOCK_STATS.get("conversion_rate", 0.0) * 100
-        ctk.CTkLabel(frame_rate, text="Tỷ lệ chuyển đổi (CR):", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=10)
-        ctk.CTkLabel(frame_rate, text=f"{rate:.2f}%").pack(side="right", padx=10, pady=10)
-        
-        # 2. Tổng số lượt hỏi
-        frame_requests = ctk.CTkFrame(tab)
-        frame_requests.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
-        requests = MOCK_STATS.get("total_requests", 0)
-        ctk.CTkLabel(frame_requests, text="Tổng số lượt hỏi:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=10)
-        ctk.CTkLabel(frame_requests, text=f"{requests} lượt").pack(side="right", padx=10, pady=10)
-        
-        # 3. Sản phẩm được nhắc nhiều
-        ctk.CTkLabel(tab, text="Top 3 Sản phẩm được nhắc nhiều:", font=ctk.CTkFont(weight="bold")).grid(row=3, column=0, padx=10, pady=(10, 0), sticky="w")
-        
-        product_text = "Không có dữ liệu"
-        products = MOCK_STATS.get("products_mentioned", {})
-        if products:
-             # Sort and format top 3
-             sorted_products = sorted(products.items(), key=lambda item: item[1], reverse=True)[:3]
-             product_text = "\n".join([f"- {name}: {count} lần" for name, count in sorted_products])
-        
-        ctk.CTkLabel(tab, text=product_text, justify="left").grid(row=4, column=0, padx=20, pady=(5, 10), sticky="w")
-
-
-    def _create_scenario_tab(self, tab):
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_columnconfigure(1, weight=2)
-        tab.grid_rowconfigure(2, weight=1)
-
-        ctk.CTkLabel(tab, text="Quản lý Kịch Bản (CRUD Intents - Mock)", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="w")
-        
-        # 1. Intent List (Left side)
-        list_frame = ctk.CTkFrame(tab)
-        list_frame.grid(row=1, column=0, rowspan=2, padx=(10, 5), pady=5, sticky="nsew")
-        list_frame.grid_columnconfigure(0, weight=1)
-        
-        ctk.CTkLabel(list_frame, text="Danh sách Intents:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        
-        intent_names = [item["intent_name"] for item in self.scenario_intents]
-        self.intent_listbox = tk.Listbox(list_frame, height=10, selectmode=tk.SINGLE, bg=list_frame.cget("fg_color")[1], fg="white", selectbackground=list_frame.cget("fg_color")[0])
-        for name in intent_names:
-             self.intent_listbox.insert(tk.END, name)
-             
-        self.intent_listbox.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="nsew")
-        self.intent_listbox.bind('<<ListboxSelect>>', self._load_selected_intent)
-
-        crud_button_frame = ctk.CTkFrame(list_frame)
-        crud_button_frame.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
-        crud_button_frame.columnconfigure((0, 1), weight=1)
-        ctk.CTkButton(crud_button_frame, text="➕ Thêm").grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        ctk.CTkButton(crud_button_frame, text="❌ Xóa").grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-
-
-        # 2. Detail/Edit Panel (Right side)
-        self.detail_frame = ctk.CTkFrame(tab)
-        self.detail_frame.grid(row=1, column=1, rowspan=2, padx=(5, 10), pady=5, sticky="nsew")
-        self.detail_frame.grid_columnconfigure(0, weight=1)
-        self.detail_frame.grid_rowconfigure(3, weight=1)
-        
-        ctk.CTkLabel(self.detail_frame, text="Chi tiết Intent:").grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
-        
-        self.intent_name_label = ctk.CTkLabel(self.detail_frame, text="Intent Name: -", anchor="w")
-        self.intent_name_label.grid(row=1, column=0, padx=10, pady=2, sticky="ew")
-        
-        ctk.CTkLabel(self.detail_frame, text="Phản hồi (1/n):", anchor="w").grid(row=2, column=0, padx=10, pady=(5, 0), sticky="ew")
-        self.response_textbox = ctk.CTkTextbox(self.detail_frame, height=150)
-        self.response_textbox.grid(row=3, column=0, padx=10, pady=(0, 5), sticky="nsew")
-        self.response_textbox.insert("0.0", "Chọn một Intent để xem/sửa phản hồi.")
-        self.response_textbox.configure(state="disabled")
-        
-        ctk.CTkButton(self.detail_frame, text="💾 Lưu Thay Đổi (Mock)").grid(row=4, column=0, padx=10, pady=(0, 10), sticky="ew")
-        
-        if intent_names:
-            self.intent_listbox.select_set(0)
-            self._load_selected_intent(None)
-
-    def _load_selected_intent(self, event):
-        """Tải dữ liệu intent đã chọn vào khung chi tiết."""
-        if not self.intent_listbox.curselection():
-            return
-
-        selected_index = self.intent_listbox.curselection()[0]
-        selected_name = self.intent_listbox.get(selected_index)
-        
-        intent_data = next((item for item in self.scenario_intents if item["intent_name"] == selected_name), None)
-
-        if intent_data:
-            self.intent_name_label.configure(text=f"Intent Name: {selected_name}")
-            
-            responses_text = "\n---\n".join(intent_data.get("responses", ["No responses defined."]))
-            
-            self.response_textbox.configure(state="normal")
-            self.response_textbox.delete("0.0", "end")
-            self.response_textbox.insert("0.0", responses_text)
-            self.response_textbox.configure(state="disabled")
-        else:
-            self.intent_name_label.configure(text=f"Intent Name: {selected_name} (Not found in data)")
-            self.response_textbox.configure(state="normal")
-            self.response_textbox.delete("0.0", "end")
-            self.response_textbox.insert("0.0", "Không tìm thấy dữ liệu kịch bản.")
-            self.response_textbox.configure(state="disabled")
-
-    def _create_sales_tab(self, tab):
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(2, weight=1)
-
-        ctk.CTkLabel(tab, text="Báo Cáo Doanh Số (Mock Data)", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
-        
-        sales_data = MOCK_STATS.get("sales_data", [])
-        
-        ctk.CTkLabel(tab, text="Doanh số gần nhất:", font=ctk.CTkFont(weight="bold")).grid(row=1, column=0, padx=10, pady=(0, 5), sticky="w")
-        
-        # Table frame
-        table_frame = ctk.CTkScrollableFrame(tab)
-        table_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
-        table_frame.grid_columnconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(1, weight=1)
-        table_frame.grid_columnconfigure(2, weight=1)
-
-        # Header
-        ctk.CTkLabel(table_frame, text="Ngày", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=5, pady=2, sticky="ew")
-        ctk.CTkLabel(table_frame, text="Doanh Số", font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, padx=5, pady=2, sticky="e")
-        ctk.CTkLabel(table_frame, text="CR", font=ctk.CTkFont(weight="bold")).grid(row=0, column=2, padx=5, pady=2, sticky="e")
-
-        # Data rows
-        for i, row in enumerate(sales_data):
-            date = row.get("date", "N/A")
-            # Format tiền tệ
-            sales = f"{row.get('sales', 0):,}".replace(",", "X").replace(".", ",").replace("X", ".") + " VND" 
-            cr = f"{row.get('conversion_rate', 0.0)*100:.2f}%"
-            
-            ctk.CTkLabel(table_frame, text=date).grid(row=i+1, column=0, padx=5, pady=1, sticky="w")
-            ctk.CTkLabel(table_frame, text=sales).grid(row=i+1, column=1, padx=5, pady=1, sticky="e")
-            ctk.CTkLabel(table_frame, text=cr).grid(row=i+1, column=2, padx=5, pady=1, sticky="e")
-            
-        ctk.CTkLabel(tab, text="... (Báo cáo tổng hợp)").grid(row=3, column=0, padx=10, pady=10, sticky="w")
-
-    # -------------------- LOGGING & CONFIG --------------------
+    # ... (các hàm log, _append_log_safe, _save_ui_config, _load_ui_config giữ nguyên) ...
 
     def log(self, message: str, color: str = "white"):
         """In log ra console và UI."""
@@ -383,6 +276,7 @@ class App(ctk.CTk):
             "audio_device": self.audio_device_var.get()
         }
         try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4)
             self.log("💾 [CONFIG] Cấu hình UI đã được lưu.", "green")
@@ -403,9 +297,10 @@ class App(ctk.CTk):
             except Exception as e:
                 self.log(f"⚠️ [CONFIG] Lỗi tải cấu hình: {e}", "orange")
 
+
     # -------------------- CORE MODULE INITIALIZATION --------------------
     def _initialize_core_modules(self):
-        """Khởi tạo DialogManager và VoiceIOHandler trong một thread riêng."""
+        """Khởi tạo DialogManager, VoiceIOHandler, và RTCProcessor trong một thread riêng."""
         if self.dm_initialized: return
         self.dm_initialized = True
         self.log("⏳ [APP] Bắt đầu khởi tạo core modules...", "yellow")
@@ -421,8 +316,12 @@ class App(ctk.CTk):
                 api_key=self.api_key_var.get(), 
                 voice_manager=self.voice_io 
             )
+
+            # 3. Khởi tạo RTC Processor (Phần quan trọng)
+            self.rtc_processor = RTCStreamProcessor(log_callback=self.log)
             
-            is_ready = self.dm.is_ready() and self.voice_io.is_ready()
+            # Kiểm tra trạng thái sẵn sàng
+            is_ready = self.dm.is_ready() and self.voice_io.is_ready() and self.rtc_processor is not None
             
             if is_ready:
                  self.log("✅ [APP] Core modules đã sẵn sàng!", "green")
@@ -437,7 +336,7 @@ class App(ctk.CTk):
                  self.after(0, lambda: self._update_buttons(False))
 
         except Exception as e:
-            self.log(f"❌ [APP] Lỗi khởi tạo core modules: {e}", "red")
+            self.log(f"❌ [APP] Lỗi khởi tạo core modules: {e}. Vui lòng kiểm tra các file dependency.", "red")
             self.after(0, lambda: self.status_label.configure(text="Trạng Thái: 🔴 Lỗi Core"))
             self.dm_initialized = False 
             self.after(0, lambda: self._update_buttons(False))
@@ -447,187 +346,211 @@ class App(ctk.CTk):
         if self._save_ui_config():
             self.log("🔄 [CONFIG] Config changed. Re-initializing DM...", "yellow")
             
-            if self.dm and hasattr(self.dm, 'terminate'): 
-                 try: self.dm.terminate()
-                 except Exception: pass
-                 
-            if self.voice_io and hasattr(self.voice_io, 'terminate'):
-                 try: self.voice_io.terminate()
-                 except Exception: pass
+            self.stop_processing_command()
+            time.sleep(0.1)
             
+            # Đảm bảo reset các biến để khởi tạo lại
+            self.dm = None; self.voice_io = None; self.rtc_processor = None
             self.dm_initialized = False 
+            
             self._update_buttons(False) 
             threading.Thread(target=self._initialize_core_modules, daemon=True).start()
+            
+    # -------------------- RTC STREAM PROCESSING --------------------
 
+    async def create_stream_from_file(self, file_path: str) -> AsyncGenerator[bytes, None]:
+        """Tạo Async Generator từ file WAV đã tải lên."""
+        self.log(f"📥 [File Stream] Bắt đầu đọc file: {file_path}", "blue")
+        try:
+            with wave.open(file_path, 'rb') as wf:
+                if wf.getframerate() != SAMPLE_RATE or wf.getnchannels() != CHANNELS or wf.getsampwidth() != 2:
+                    self.log(f"❌ [File Stream] Định dạng file WAV không đúng (cần {SAMPLE_RATE}Hz, mono, 16-bit).", "red")
+                    return 
+                
+                while True:
+                    chunk = wf.readframes(CHUNK_SIZE)
+                    if not chunk: break
+                    yield chunk
+                    await asyncio.sleep(0.001)
+            self.log("📥 [File Stream] Hoàn tất truyền file.", "blue")
+        except Exception as e:
+            self.log(f"❌ [File Stream] Lỗi khi đọc file audio: {e}", "red")
+            
+    async def _mic_rtc_stream_async(self) -> AsyncGenerator[bytes, None]:
+        """Giả lập luồng audio từ microphone cho RTC."""
+        self.log("MOCK: Microphone đang tạo luồng audio...", "yellow")
+        
+        while self.is_recording and not self.process_stop_event.is_set():
+            yield b'\x00' * CHUNK_SIZE
+            await asyncio.sleep(0.01)
+            
+        self.log("MOCK: Microphone dừng luồng.", "yellow")
+
+    def start_processing_rtc(self, audio_stream_generator: Callable[[], AsyncGenerator[bytes, None]]):
+        """Khởi chạy một luồng mới để xử lý RTC session."""
+        if self.is_processing or not self.rtc_processor:
+            self.log("⚠️ [App] RTC Processor chưa sẵn sàng hoặc đang bận.", "orange")
+            return
+
+        self.is_processing = True
+        self._update_buttons(False) 
+        
+        self.log("🚀 [RTC] Bắt đầu xử lý RTC session trong luồng...", "green")
+
+        threading.Thread(
+            target=self._run_async_processing,
+            args=(audio_stream_generator,),
+            daemon=True
+        ).start()
+
+    def _run_async_processing(self, audio_stream_generator: Callable[[], AsyncGenerator[bytes, None]]):
+        """Hàm đồng bộ chạy trong thread để khởi tạo loop asyncio và chạy session."""
+        self.process_stop_event.clear()
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            loop.run_until_complete(self._handle_rtc_session_async(audio_stream_generator()))
+            
+        except Exception as e:
+            self.log(f"❌ [App Thread] Lỗi nghiêm trọng trong luồng xử lý RTC: {e}", "red")
+            traceback.print_exc()
+        finally:
+            self.is_processing = False
+            self.process_stop_event.clear()
+            self.after(0, lambda: self._update_buttons(self.dm.is_ready() if self.dm else False))
+            
+    async def _handle_rtc_session_async(self, audio_stream: AsyncGenerator[bytes, None]):
+        """Xử lý phiên RTC (async) và tiêu thụ luồng đầu ra."""
+        REQUEST_COUNTER.inc()
+        start_time = time.time()
+        session_id = str(uuid.uuid4())
+        
+        try:
+            self.log(f"🚀 [RTC] Session ID: {session_id}. Bắt đầu gọi RTC Processor...", "green")
+            self.after(0, lambda: self.progress_bar.set(0.1))
+            
+            output_stream: AsyncGenerator[Tuple[bool, Any], None] = self.rtc_processor.handle_rtc_session(audio_stream, session_id=session_id)
+            
+            async for is_audio, data in output_stream: 
+                if self.process_stop_event.is_set(): self.log("🛑 [TTS] Phát âm thanh bị hủy.", "red"); break
+                
+                if not is_audio:
+                    full_transcript = data.get("user_text", "[Lỗi Transcript]")
+                    response_text = data.get("bot_text", "[Lỗi Phản Hồi]")
+                    
+                    self.after(0, lambda: self.asr_label.configure(text=f"User (ASR): {full_transcript}"))
+                    self.after(0, lambda: self._append_chat_safe("User", full_transcript, "User"))
+                    self.after(0, lambda: self._append_chat_safe("Bot", response_text, "Bot"))
+                    
+                    self.log(f"📝 [Chat Log] User: {anonymize_text(full_transcript)} | Bot: {anonymize_text(response_text)}", "cyan")
+                    self.after(0, lambda: self.progress_bar.set(0.3)) 
+                
+                else:
+                    self.log(f"🔈 [TTS Out] Nhận chunk phản hồi ({len(data)} bytes)", "purple")
+                    self.after(0, lambda: self.progress_bar.set(0.5)) 
+                
+            duration = time.time() - start_time
+            RESPONSE_TIME_GAUGE.set(duration)
+            self.log(f"✅ [RTC] Phiên hoàn tất. Thời gian phản hồi: {duration:.3f}s. File ghi âm đã lưu tại: {RECORDING_DIR}", "green")
+            
+            if not self.process_stop_event.is_set():
+                 self.after(0, lambda: self.asr_label.configure(text=f"User (Stream): Xử lý hoàn tất."))
+                 self.after(0, lambda: self.progress_bar.set(1.0))
+            
+        except Exception as e:
+            ERROR_COUNTER.inc()
+            self.log(f"❌ [RTC] Lỗi xử lý session: {e}", "red")
+            traceback.print_exc()
+            
     # -------------------- ACTION HANDLERS --------------------
     
     def stop_processing_command(self):
         """Gửi tín hiệu dừng tới thread xử lý và VoiceIO."""
-        if self.is_processing:
-            self.process_stop_event.set() # Set the flag to interrupt processing thread
-            if self.voice_io:
-                 self.voice_io.stop_event.set() # Dừng Playback (nếu đang nói)
-            self.log("🛑 [PROCESS] Stop signal sent to processing thread.", "red")
+        if self.is_processing or self.is_recording:
+            self.process_stop_event.set() 
+            if self.voice_io: self.voice_io.stop_event.set() 
+            self.log("🛑 [PROCESS] Stop signal sent.", "red")
+            if self.is_recording:
+                self.is_recording = False
+                self.mic_stream = None
+                self._update_buttons(self.dm.is_ready() if self.dm else False)
+
         else:
             self.log("⚠️ [PROCESS] Không có tiến trình nào đang chạy để dừng.", "orange")
 
     def start_recording_command(self):
-        """Bắt đầu ghi âm."""
+        """Bắt đầu ghi âm bằng cách kích hoạt luồng RTC từ Mic."""
         if self.is_recording or self.is_processing or self.is_speaking:
             self.log("⚠️ [IO] Đang bận. Không thể bắt đầu ghi âm.", "orange")
             return
 
-        is_ready = self.dm and self.dm.is_ready() and self.voice_io and self.voice_io.is_ready()
+        is_ready = self.rtc_processor is not None
         if not is_ready:
-            error_msg = self.voice_io.get_initial_error() if self.voice_io and not self.voice_io.is_ready() else (self.dm.get_initial_error() if self.dm and not self.dm.is_ready() else "DM/IO Lỗi không xác định.")
-            self.log(f"❌ [IO] DM/IO chưa sẵn sàng. Lỗi: {error_msg}", "red")
-            messagebox.showerror("DM/IO Lỗi", f"Hệ thống chưa sẵn sàng để ghi âm. {error_msg}")
+            # Lỗi này đã được log, nhưng chúng ta vẫn cần dừng lại nếu biến là None
+            self.log(f"❌ [IO] RTC Processor chưa sẵn sàng. (biến rtc_processor là None)", "red")
+            messagebox.showerror("Lỗi RTC", "Hệ thống RTC chưa sẵn sàng. Vui lòng kiểm tra Log.")
             return
 
         self.is_recording = True
         self.rec_start_time = time.time()
-        self.asr_label.configure(text="User (ASR): Đang lắng nghe...")
-        self.log("🎤 [IO] Bắt đầu ghi âm...", "yellow")
+        self.asr_label.configure(text="User (RTC Stream): Đang lắng nghe...")
+        self.log("🎤 [RTC] Bắt đầu Ghi âm từ Mic (Stream)...", "yellow")
         self.progress_bar.set(0.0)
-
-        self._update_buttons(False) # Force disable all buttons except Stop Rec
-
-        try:
-            success = self.voice_io.start_recording()
-            if not success:
-                 self.is_recording = False
-                 self.log("❌ [IO] VoiceIOHandler không thể bắt đầu ghi âm.", "red")
-                 messagebox.showerror("Lỗi Ghi Âm", "Không thể khởi động bộ ghi âm.")
-                 self._update_buttons(self.dm.is_ready() if self.dm else False) 
-        except Exception as e:
-            self.is_recording = False
-            self.log(f"❌ [IO] Lỗi khi start_recording: {e}", "red")
-            messagebox.showerror("Lỗi Ghi Âm", f"Lỗi: {e}")
-            self._update_buttons(self.dm.is_ready() if self.dm else False)
-
-
+        self._update_buttons(False) 
+        
+        self.mic_stream = self._mic_rtc_stream_async() 
+        
     def stop_recording_command(self):
-        """Dừng ghi âm và bắt đầu xử lý dialog."""
-        if not self.is_recording: return
+        """Dừng ghi âm và bắt đầu xử lý RTC session với luồng từ Mic."""
+        if not self.is_recording or self.is_processing: return
 
         self.is_recording = False
-        self.is_processing = True
         self.duration_label.configure(text="0.00s")
-        self.log("🛑 [IO] Dừng ghi âm. Bắt đầu xử lý...", "yellow")
+        self.log("🛑 [RTC] Dừng Ghi âm. Bắt đầu Xử lý Stream...", "yellow")
 
-        self._update_buttons(False) # Force disable all buttons
-
-        try:
-            audio_file_path = self.voice_io.stop_recording()
-            if not audio_file_path or not Path(audio_file_path).exists() or Path(audio_file_path).stat().st_size == 0:
-                 raise FileNotFoundError("File ghi âm không được tạo hoặc rỗng.")
+        self._update_buttons(False) 
+        
+        current_mic_stream = self.mic_stream
+        
+        if current_mic_stream:
+            def mic_stream_generator():
+                return current_mic_stream 
             
-            self.log(f"💾 [IO] Audio saved to: {audio_file_path}", "cyan")
-            self.after(0, lambda: self.progress_bar.set(0.1))
-
-            # Start processing thread
-            self.processing_thread = threading.Thread(target=self._process_dialog, args=(audio_file_path,), daemon=True)
-            self.processing_thread.start()
-
-        except Exception as e:
-            self.is_processing = False 
-            self.log(f"❌ [IO] Lỗi khi stop_recording/lưu file: {e}", "red")
-            messagebox.showerror("Lỗi Ghi Âm", f"Lỗi dừng ghi âm: {e}")
-            self._update_buttons(self.dm.is_ready() if self.dm else False) 
-
-
-    def _process_dialog(self, audio_path: str):
-        """Thực hiện chu trình ASR -> NLU -> LLM -> TTS."""
-        start_time = time.time()
-        self.process_stop_event.clear() # Clear the stop flag for the new process
-        REQUEST_COUNTER.inc()
-        response = {"response_text": "Lỗi xử lý chung.", "current_state": "ERROR", "db_info": {"error": "Processing failed"}, "user_input_asr": ""}
-
-        try:
-            self.log("🤖 [DM] Xử lý Dialog Manager...", "blue")
-            self.after(0, lambda: self.progress_bar.set(0.2))
-
-            if self.process_stop_event.is_set(): 
-                self.log("🛑 [DM] Tiến trình bị hủy bởi người dùng.", "red"); return # Exit early
-                
-            if self.dm and self.dm.is_ready():
-                response = self.dm.process_audio_file(audio_path)
-                self.after(0, lambda: self.progress_bar.set(0.7))
-            else:
-                 response['error'] = "DM not ready for processing."
-                 raise RuntimeError("DM not ready.")
-
-            if self.process_stop_event.is_set(): 
-                self.log("🛑 [DM] Tiến trình bị hủy bởi người dùng (sau ASR/NLU).", "red"); return # Exit early
-
-            # 2. Extract and Log Results
-            user_input_asr = response.get('user_input_asr', '[Không có ASR]')
-            bot_response = response.get('response_text', '[Không có phản hồi]')
-            current_state = response.get('current_state', 'N/A')
-            db_info = response.get('db_info', {})
-            nlu_intent = db_info.get('nlu_result', {}).get('intent', 'N/A')
-            
-            log_data_json = json.dumps({
-                "timestamp": _dt.now().isoformat(),
-                "user_input_asr": anonymize_text(user_input_asr),
-                "response_text": anonymize_text(bot_response),
-                "status": current_state,
-                "nlu_result": db_info.get('nlu_result', {}),
-                "duration": time.time() - start_time
-            })
-            log_to_file(log_data_json, LOG_FILE_PATH)
-            
-            self.log(f"📝 [TRANSACTION] ASR: {anonymize_text(user_input_asr[:50])} | Intent: {nlu_intent} | Status: {current_state}", "cyan")
-            
-
-            # 3. Update UI Chat
-            self.after(0, lambda: self.asr_label.configure(text=f"User (ASR): {user_input_asr}"))
-            self.after(0, lambda: self._append_chat_safe("User", user_input_asr, "User"))
-            self.after(0, lambda: self._append_chat_safe("Bot", bot_response, "Bot"))
-            self.log(f"💬 [DM] State={current_state}, Intent={nlu_intent}", "blue")
-
-            # 4. Text-to-Speech (TTS)
-            tts_path = response.get('response_audio_path', TEMP_TTS_FILE) 
-            if os.path.exists(tts_path) and self.voice_io:
-                 if self.process_stop_event.is_set(): # Check again before blocking play
-                     self.log("🛑 [TTS] Phát âm thanh bị hủy.", "red"); return 
-                 
-                 self.is_speaking = True
-                 self.log(f"🔈 [IO] Phát phản hồi từ: {os.path.basename(tts_path)}", "purple")
-                 self.voice_io.play_audio_response(tts_path) 
-                 self.is_speaking = False
-            else:
-                 self.log("⚠️ [TTS] Không tìm thấy file audio phản hồi hoặc VoiceIO chưa sẵn sàng.", "orange")
-
-        except Exception as e:
-            self.log(f"❌ [DM] Lỗi xử lý chính: {e}", "red")
-            traceback_str = traceback.format_exc()
-            self.log(f"    Traceback:\n{traceback_str}", "red")
-            self.after(0, lambda: self._append_chat_safe("Error", "Lỗi xử lý: " + str(e), "error"))
-            ERROR_COUNTER.inc()
-
-        finally:
+            self.start_processing_rtc(mic_stream_generator)
+            self.mic_stream = None
+        else:
             self.is_processing = False
-            self.is_speaking = False
+            self.log("❌ [RTC] Lỗi: Không có luồng mic đang hoạt động (Mic stream là None).", "red")
+            self.after(0, lambda: self._update_buttons(self.dm.is_ready() if self.dm else False))
+
+
+    def upload_audio_file(self):
+        """Xử lý nút tải lên file audio và khởi chạy RTC streaming."""
+        if self.is_processing or self.is_recording or self.is_speaking or not self.rtc_processor:
+             return
+
+        file_path = filedialog.askopenfilename(
+            title="Chọn file Audio WAV (16kHz, mono, 16-bit)",
+            filetypes=[("WAV files", "*.wav")]
+        )
+
+        if file_path:
+            self.log(f"⬆️ [Upload] Đã chọn file: {file_path}", "blue")
             
-            end_time = time.time()
-            if self.process_stop_event.is_set():
-                 self.log(f"⚠️ [APP] Tiến trình đã bị dừng sau {end_time - start_time:.2f}s.", "orange")
-            else:
-                 response_time = end_time - start_time
-                 RESPONSE_TIME_GAUGE.set(response_time)
-                 self.log(f"✅ [APP] Xử lý hoàn tất. Thời gian: {response_time:.2f}s", "green")
+            stream_generator_obj = self.create_stream_from_file(file_path)
             
-            self.process_stop_event.clear() # Ensure the flag is cleared on exit
-            self.after(0, lambda: self.progress_bar.set(1.0))
-            self._update_buttons(self.dm.is_ready() if self.dm else False) 
+            def file_stream_generator():
+                return stream_generator_obj
+            
+            self.start_processing_rtc(file_stream_generator)
 
     def _append_chat_safe(self, sender, message, tag):
         """Ghi nội dung chat an toàn vào textbox của UI."""
         try:
             if hasattr(self, 'chat_textbox') and self.chat_textbox.winfo_exists():
                  self.chat_textbox.configure(state="normal")
-                 tag_map = {"User": "blue", "Bot": "green", "Error": "red"}
+                 tag_map = {"User": "blue", "Bot": "green", "Error": "red"} 
                  self.chat_textbox.insert("end", f"[{sender}]: {message}\n", (tag,))
                  for t, c in tag_map.items(): self.chat_textbox.tag_config(t, foreground=c)
                  self.chat_textbox.configure(state="disabled"); self.chat_textbox.see("end")
@@ -649,28 +572,33 @@ class App(ctk.CTk):
     def _force_update_buttons(self, is_dm_ready: bool):
         """Logic cập nhật trạng thái nút bấm."""
         is_io_ready = self.voice_io and self.voice_io.is_ready()
+        is_rtc_ready = self.rtc_processor is not None
+        is_core_ready = is_dm_ready and is_io_ready and is_rtc_ready
+        
+        upload_state = "normal" if is_core_ready and not self.is_processing and not self.is_recording else "disabled"
+        self.upload_button.configure(state=upload_state)
         
         if self.is_recording:
             self.record_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
             self.stop_process_button.configure(state="disabled") 
-            self.status_label.configure(text="Trạng Thái: 🔴 Đang Ghi Âm")
+            self.status_label.configure(text="Trạng Thái: 🔴 Đang Ghi Âm (RTC)")
         elif self.is_processing or self.is_speaking:
             self.record_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
-            self.stop_process_button.configure(state="normal") # Cho phép dừng tiến trình
+            self.stop_process_button.configure(state="normal") 
             self.status_label.configure(text="Trạng Thái: 🟡 Đang Xử Lý/Nói...")
-        elif is_dm_ready and is_io_ready:
+        elif is_core_ready:
             self.record_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
             self.stop_process_button.configure(state="disabled") 
-            self.status_label.configure(text="Trạng Thái: 🟢 Sẵn Sàng")
+            self.status_label.configure(text="Trạng Thái: 🟢 Sẵn Sàng (RTC/File)")
         else:
             self.record_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
             self.stop_process_button.configure(state="disabled") 
-            io_error = self.voice_io.get_initial_error() if self.voice_io and not self.voice_io.is_ready() else "Core Lỗi"
-            self.status_label.configure(text=f"Trạng Thái: 🔴 Lỗi ({io_error[:10]}...)")
+            io_error = "Core Lỗi"
+            self.status_label.configure(text=f"Trạng Thái: 🔴 Lỗi ({io_error})")
 
     # -------------------- CLOSING HANDLER --------------------
     def _on_closing(self):
@@ -678,7 +606,6 @@ class App(ctk.CTk):
         self.log("👋 [APP] Ứng dụng đang đóng...", "yellow")
         self._save_ui_config() 
         
-        # Signal any active process/recording to stop
         self.stop_processing_command() 
         time.sleep(0.5)
 
@@ -689,8 +616,9 @@ class App(ctk.CTk):
         if self.voice_io and hasattr(self.voice_io, 'terminate'):
             try: self.voice_io.terminate()
             except Exception as e: self.log(f"⚠️ [APP] Error terminating Voice IO: {e}", "orange")
+            
+        self.log(f"💾 [Recorder] File ghi âm được lưu tại thư mục: {RECORDING_DIR}", "orange")
 
-        # Clean up temp files
         for f in [AUDIO_FILE, TEMP_TTS_FILE]:
             if f and os.path.exists(f):
                 try: os.remove(f)
@@ -701,23 +629,19 @@ class App(ctk.CTk):
 # ==================== PHẦN III: KHỞI CHẠY ỨNG DỤNG ====================
 
 if __name__ == "__main__":
-    # Clean up temp files
     for f in [AUDIO_FILE, TEMP_TTS_FILE]:
         if f and os.path.exists(f): 
             try: os.remove(f)
             except Exception: pass
     
-    # Start Prometheus
     try:
         if 'start_http_server' in globals() and start_http_server is not None:
-             # Lấy PROMETHEUS_PORT từ globals, đã được đặt ở trên
             start_http_server(PROMETHEUS_PORT); styled_print(f"📈 [Metrics] Prometheus server on port {PROMETHEUS_PORT}", "green")
     except OSError as e:
          if "Address already in use" in str(e): styled_print(f"⚠️ [Metrics] Port {PROMETHEUS_PORT} in use.", "orange")
          else: styled_print(f"❌ [Metrics] Error starting Prometheus: {e}", "red")
     except Exception as e: styled_print(f"❌ [Metrics] Error starting Prometheus: {e}", "red")
     
-    # Run App
     app = App()
     app.protocol("WM_DELETE_WINDOW", app._on_closing)
     app.mainloop()
