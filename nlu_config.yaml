@@ -1,0 +1,86 @@
+# nlu_config.yaml
+
+intents:
+  ask_price:
+    description: "Hỏi về giá của một sản phẩm cụ thể."
+    examples:
+      - "Giá của chiếc Vision bao nhiêu?"
+      - "Chiếc xe SH Mode hiện tại có giá bán là bao nhiêu?"
+      - "Báo giá sản phẩm X."
+
+  ask_promotion:
+    description: "Hỏi về các chương trình khuyến mãi, ưu đãi hiện có."
+    examples:
+      - "Hiện giờ đang có chương trình khuyến mãi nào không?"
+      - "Mua hàng có được giảm giá không?"
+      - "Ưu đãi cho xe Exciter là gì?"
+
+  order_product:
+    description: "Đặt mua sản phẩm, xác nhận mua hàng."
+    examples:
+      - "Tôi muốn đặt mua chiếc Vision màu trắng."
+      - "Tôi mua một chiếc Exciter."
+      - "Tiến hành đặt hàng sản phẩm này."
+
+  check_order_status:
+    description: "Tra cứu trạng thái đơn hàng đã đặt."
+    examples:
+      - "Kiểm tra đơn hàng của tôi."
+      - "Đơn hàng ORD123 đã giao chưa?"
+      - "Cho tôi xem tình trạng đơn hàng."
+
+  small_talk:
+    description: "Các câu nói giao tiếp thông thường, chào hỏi, tạm biệt, cảm ơn."
+    examples:
+      - "Chào bạn."
+      - "Cảm ơn nhé."
+      - "Bạn tên là gì?"
+
+  fallback:
+    description: "Intent mặc định khi không phân loại được ý định nào."
+    examples:
+      - "Tôi không rõ."
+      - "Báo thời tiết."
+
+entities:
+  product_name:
+    description: "Tên chính xác của sản phẩm (ví dụ: Vision, Exciter, SH Mode)."
+    type: LIST_BASED
+    examples:
+      - "Vision"
+      - "Exciter"
+      - "SH Mode"
+      - "AirBlade"
+      - "Wave Alpha"
+
+  brand:
+    description: "Thương hiệu sản phẩm nếu không rõ tên (ví dụ: Honda, Yamaha)."
+    type: LIST_BASED
+    examples:
+      - "Honda"
+      - "Yamaha"
+      - "Suzuki"
+
+  quantity:
+    description: "Số lượng sản phẩm muốn mua."
+    type: NUMBER
+    examples:
+      - "1"
+      - "2 chiếc"
+      - "ba cái"
+
+  color:
+    description: "Màu sắc của sản phẩm."
+    type: LIST_BASED
+    examples:
+      - "trắng"
+      - "đen"
+      - "đỏ"
+      - "xanh"
+
+  order_id:
+    description: "Mã đơn hàng"
+    type: FREE_TEXT
+    examples:
+      - "ORD123"
+      - "mã 456"

@@ -1,0 +1,6 @@
+{
+  "api_key": "AIzaSyDlGSuHDciNz8kZ8D5v6lXlJYR7kOdOoZo",
+  "llm_mode": "API",
+  "nlu_mode": "API",
+  "db_mode": "API"
+}

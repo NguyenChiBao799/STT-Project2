@@ -1,0 +1,20 @@
+[2025-10-27 15:35:18] ⚠️ [IO] Sử dụng VoiceIOMock.
+[2025-10-27 15:35:18] ⚙️ [APP] Đang khởi tạo Core Modules...
+[2025-10-27 15:35:18] 🛠️ [DM] Khởi tạo các Modules...
+[2025-10-27 15:35:18] ⚠️ Using Mock DB Connector
+[2025-10-27 15:35:18] ✅ [DM] Khởi tạo Modules hoàn tất. Sẵn sàng: True
+[2025-10-27 15:35:18] ✅ [APP] Khởi tạo DM thành công!
+[2025-10-27 15:35:27] 👋 [APP] Ứng dụng đang thoát...
+[2025-10-27 15:37:59] ⚠️ [IO] Sử dụng VoiceIOMock.
+[2025-10-27 15:37:59] ⚙️ [APP] Đang khởi tạo Core Modules...
+[2025-10-27 15:37:59] 🛠️ [DM] Khởi tạo các Modules...
+[2025-10-27 15:37:59] ⚠️ Using Mock DB Connector
+[2025-10-27 15:37:59] ✅ [DM] Khởi tạo Modules hoàn tất. Sẵn sàng: True
+[2025-10-27 15:37:59] ✅ [APP] Khởi tạo DM thành công!
+[2025-10-27 15:38:01] 🎤 [IO] Ghi âm Mock Bắt đầu.
+[2025-10-27 15:38:01] ▶️ [TURN] Bắt đầu xử lý lượt hội thoại...
+[2025-10-27 15:38:01] 💬 [BOT] Phản hồi: DB Error
+[2025-10-27 15:38:01] ⏹️ [TURN] Kết thúc xử lý. Thời gian: 0.00s
+[2025-10-27 15:38:01] 🔈 [IO] Phát audio Mock: tts_fallback.wav
+[2025-10-27 15:38:02] 🎤 [IO] Ghi âm Mock Kết thúc.
+[2025-10-27 15:38:04] 👋 [APP] Ứng dụng đang thoát...
