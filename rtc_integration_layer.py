@@ -1,147 +1,221 @@
-# rtc_integration_layer.py
-
+# rtc_integration_layer.py - Đã tích hợp ASR (Whisper Logic) và DialogManager
 import asyncio
-from typing import AsyncGenerator, Callable, Optional, AsyncIterator, Tuple, Any
+import os
+import wave
+import uuid
 import time
 from pathlib import Path
-import wave 
-import uuid 
-import os 
-from datetime import datetime as _dt 
+from typing import AsyncGenerator, Callable, Optional, Tuple, Any
+from datetime import datetime as _dt
+import numpy as np # Cần thiết cho Whisper
+import traceback 
 
-# --- Hằng số (Phải khớp với main_app.py) ---
+# --- SAFE IMPORTS (WHISPER) ---
+try:
+    import whisper
+    # Lấy WHISPER_MODEL_NAME từ config_db nếu có
+    try:
+        from config_db import WHISPER_MODEL_NAME
+    except ImportError:
+        WHISPER_MODEL_NAME = "small"
+        
+    # Tải model (CÓ THỂ GÂY LỖI KHI RE-LOAD VỚI UVICORN/MULTIPROCESSING)
+    # Nếu server vẫn lỗi, hãy chuyển việc tải model này vào hàm __init__
+    WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_NAME)
+    print(f"✅ [ASR] Whisper model '{WHISPER_MODEL_NAME}' đã được tải.")
+    WHISPER_IS_READY = True
+except Exception as e:
+    WHISPER_IS_READY = False
+    WHISPER_MODEL = None
+    print(f"❌ [ASR] Lỗi tải Whisper (pip install openai-whisper?): {e}. Sử dụng Mock.")
+
+# --- SAFE IMPORTS (DIALOG MANAGER) ---
+try:
+    from dialog_manager import DialogManager 
+    DM_IS_READY = True
+except ImportError:
+    class DialogManager:
+        def __init__(self, *args, **kwargs): pass
+        def process_audio_path(self, *args, **kwargs): 
+            return {"response_text": "LỖI DM: Không tìm thấy DialogManager.", "response_audio_path": None, "user_input_asr": "LỖI."}
+    DM_IS_READY = False
+    print("❌ [NLU] Không tìm thấy DialogManager. Sử dụng Mock Fallback.")
+
+# --- Hằng số (Phải khớp với config_db.py) ---
 SAMPLE_RATE = 16000 
 CHANNELS = 1
-CHUNK_SIZE = 1024 # <-- ĐÃ THÊM: Khắc phục lỗi ImportError
-# THƯ MỤC GHI ÂM
+CHUNK_SIZE = 1024 
 RECORDING_DIR = Path("rtc_recordings"); RECORDING_DIR.mkdir(exist_ok=True) 
 
-# ==================== MOCK SERVICES (Giả lập ASR và TTS) ====================
+# ==================== CÁC DỊCH VỤ ASR ====================
+
+class ASRServiceWhisper:
+    """ASR sử dụng OpenAI Whisper, xử lý file WAV đã lưu."""
+    def __init__(self, log_callback: Callable, model):
+        self._log = log_callback 
+        self.model = model
+        
+    async def transcribe(self, audio_filepath: Path) -> AsyncGenerator[str, None]:
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Bắt đầu xử lý Whisper trên file: {audio_filepath.name}", color="blue")
+
+        if not WHISPER_IS_READY:
+            self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Whisper không sẵn sàng. Giả lập transcript.", color="red")
+            yield "Đây là transcript giả lập khi Whisper lỗi"
+            return
+            
+        try:
+            audio = whisper.load_audio(str(audio_filepath))
+            
+            # Sử dụng asyncio.to_thread để chạy Whisper (tác vụ Blocking I/O)
+            result = await asyncio.to_thread(self.model.transcribe, audio)
+            final_transcript = result.get("text", "").strip()
+            
+            self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Transcript: '{final_transcript}'", color="blue")
+            
+            yield final_transcript
+            
+        except Exception as e:
+            self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [ASR] LỖI WHISPER: {e}", color="red")
+            # In traceback chi tiết nếu lỗi
+            self._log(traceback.format_exc(), color="red")
+            yield "" 
 
 class ASRServiceMock:
-    """Giả lập dịch vụ ASR, nhận luồng audio và trả về luồng text."""
+    """Giả lập dịch vụ ASR."""
     def __init__(self, log_callback: Callable):
         self._log = log_callback 
         self.full_transcript = "Xin cho tôi đặt một đơn hàng cuối cùng" 
 
-    async def transcribe(self, audio_stream: AsyncGenerator[bytes, None]) -> AsyncGenerator[str, None]:
-        """Xử lý luồng audio và tạo luồng transcript."""
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Bắt đầu nhận và xử lý luồng âm thanh...", color="blue")
+    async def transcribe(self, audio_filepath: Path) -> AsyncGenerator[str, None]:
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR MOCK] Bắt đầu xử lý luồng âm thanh...", color="blue")
         
-        chunk_count = 0
-        async for chunk in audio_stream:
-            chunk_count += 1
-            pass 
+        await asyncio.sleep(0.5) 
         
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Nhận {chunk_count} chunks. Kết thúc luồng audio.", color="blue")
-
-        if chunk_count > 0:
-            await asyncio.sleep(0.01) 
-            for i, word in enumerate(self.full_transcript.split()):
-                yield word + (" " if i < len(self.full_transcript.split()) - 1 else "")
-        else:
-            yield "" 
+        transcript = self.full_transcript
+        for i, word in enumerate(transcript.split()):
+            yield word + (" " if i < len(transcript.split()) - 1 else "")
+            
+# ==================== DỊCH VỤ TTS (Vẫn là Mock) ====================
 
 class TTSServiceMock:
-    """Giả lập dịch vụ TTS, nhận text và trả về luồng audio."""
+    """Giả lập dịch vụ TTS, nhận text và trả về luồng audio (bytes)."""
     def __init__(self, log_callback: Callable):
         self._log = log_callback
-
-    async def synthesize(self, text_response: str) -> AsyncGenerator[bytes, None]:
-        """Tạo luồng audio từ văn bản."""
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🔊 [TTS] Bắt đầu tạo luồng audio phản hồi...", color="purple")
         
-        # Giả lập tạo audio chunks
-        audio_chunk = f"audio_chunk_for_{text_response}".encode('utf-8')
-        # Tạo ít nhất 1 chunk để đảm bảo luồng trả về
-        num_chunks = max(1, len(audio_chunk) // CHUNK_SIZE + (1 if len(audio_chunk) % CHUNK_SIZE > 0 else 0))
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS MOCK] Bắt đầu tổng hợp âm thanh cho: '{text[:30]}...'", color="magenta")
         
-        for i in range(num_chunks):
-            # Cắt chunk theo CHUNK_SIZE
-            start_index = i * CHUNK_SIZE
-            end_index = (i + 1) * CHUNK_SIZE
-            chunk = audio_chunk[start_index:end_index]
+        mock_chunk_size = 320 
+        mock_chunk = os.urandom(mock_chunk_size) 
+        num_chunks = int(len(text) * 0.5) + 10 
+        num_chunks = max(30, min(100, num_chunks)) 
+        
+        for _ in range(num_chunks):
+            yield mock_chunk
+            await asyncio.sleep(0.005) 
             
-            if chunk:
-                 yield chunk
-                 await asyncio.sleep(0.005) 
-            else:
-                 break # Tránh chunk rỗng nếu logic cắt không hoàn hảo
-        
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🔊 [TTS] Hoàn tất tạo luồng audio.", color="purple")
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS MOCK] Kết thúc luồng audio TTS ({num_chunks} chunks).", color="magenta")
 
-
-# ==================== RTC INTEGRATION PROCESSOR =====================
+# ==================== LỚP XỬ LÝ RTC TÍCH HỢP ====================
 
 class RTCStreamProcessor:
+    
+    @staticmethod
+    async def _record_stream(audio_input_stream: AsyncGenerator[bytes, None], record_file: Path) -> Path:
+        """Ghi audio input vào file WAV và trả về đường dẫn file."""
+        
+        # CHÚ Ý: Mở file I/O blocking trong Async function là không nên, 
+        # nhưng wave.open không có phiên bản async, ta chấp nhận điều này 
+        # vì nó chỉ diễn ra một lần sau khi luồng kết thúc.
+        wf = wave.open(str(record_file), 'wb')
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2) 
+        wf.setframerate(SAMPLE_RATE)
+        
+        # Vòng lặp nhận audio chunks là async
+        async for chunk in audio_input_stream:
+            wf.writeframes(chunk) # Lỗi ở đây sẽ được bắt bởi try/except bên ngoài
+            
+        wf.close()
+        return record_file
+    
     def __init__(self, log_callback: Optional[Callable] = None):
         def default_log(message, color=None):
-            if log_callback is None:
-                print(f"[{time.strftime('%H:%M:%S')}] [LOG] {message}")
-        
+            print(f"[{_dt.now().strftime('%H:%M:%S')}] [LOG] {message}")
+
         self._log = log_callback if log_callback else default_log
-        self._asr_client = ASRServiceMock(self._log)
+
+        if WHISPER_IS_READY:
+            self._asr_client = ASRServiceWhisper(self._log, WHISPER_MODEL)
+            self._asr_mode = "WHISPER"
+        else:
+            self._asr_client = ASRServiceMock(self._log)
+            self._asr_mode = "MOCK"
+
+        # Tích hợp DialogManager và TTS Mock
+        self._dm = DialogManager(log_callback=self._log, mode="RTC") 
         self._tts_client = TTSServiceMock(self._log)
 
-    async def _record_stream(self, 
-                             audio_input_stream: AsyncGenerator[bytes, None],
-                             record_file: Path) -> AsyncGenerator[bytes, None]:
-        """Ghi âm stream đầu vào vào file và YIELD các chunk để truyền cho ASR."""
-        
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 💾 [Recorder] Bắt đầu ghi âm đầu vào vào: {record_file.name}", color="orange")
-        
-        with wave.open(str(record_file), 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2) 
-            wf.setframerate(SAMPLE_RATE)
-            
-            # ⚠️ Vòng lặp này đã được khắc phục lỗi NoneType nhờ fix trong main_app.py
-            async for chunk in audio_input_stream:
-                wf.writeframes(chunk)
-                yield chunk # Truyền chunk sang bước tiếp theo (ASR)
-
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 💾 [Recorder] Hoàn tất ghi âm: {record_file.name}", color="orange")
-
-
     async def handle_rtc_session(self, 
-                                 audio_input_stream: AsyncGenerator[bytes, None], 
+                                 audio_input_stream: AsyncGenerator[bytes, None],
                                  session_id: str) \
                                  -> AsyncGenerator[Tuple[bool, Any], None]:
-        """
-        Xử lý phiên RTC: Ghi âm đầu vào -> ASR/NLU -> TTS.
-        Trả về luồng audio TTS và luồng text metadata.
-        Output Format: (is_audio: bool, data: Any)
-        """
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ▶️ [RTC] Bắt đầu phiên RTC...", color="cyan")
         
-        # 1. Ghi âm đầu vào và tạo stream mới
+        self._log("▶️ [RTC] Bắt đầu phiên RTC...", color="cyan")
+        
         record_file = RECORDING_DIR / f"{session_id}_input.wav"
-        # Luồng này vừa ghi âm vừa truyền chunk cho ASR
-        recording_and_passing_stream = self._record_stream(audio_input_stream, record_file)
-
-        # 2. Xử lý ASR
-        asr_stream = self._asr_client.transcribe(recording_and_passing_stream)
         full_transcript = ""
-        async for partial_text in asr_stream:
-            full_transcript += partial_text
+        response_text = "Xin lỗi, tôi chưa thể xử lý yêu cầu."
         
-        # 3. NLU/Response Logic (Mock)
-        response_text = "Tôi không hiểu yêu cầu của bạn. Vui lòng nói lại."
-        if full_transcript and "đơn hàng" in full_transcript.lower():
-            response_text = "Đã tìm thấy yêu cầu đặt đơn hàng. Bạn muốn sản phẩm nào?"
-        
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🧠 [NLU] Transcript: '{full_transcript[:30]}...' -> Response: '{response_text[:30]}...' (File: {record_file.name})", color="green")
+        # ⚠️ KHỐI TRY LỚN: Bao bọc toàn bộ logic phiên để đảm bảo finally chạy
+        try: 
+            # 1. Ghi âm thanh vào file WAV
+            try:
+                # Ghi luồng audio, đợi cho đến khi hết luồng
+                await self._record_stream(audio_input_stream, record_file)
+                self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 💾 [Recorder] Đã lưu audio input vào: {record_file.name}", color="orange")
+            except Exception as e:
+                self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [Recorder] Lỗi ghi file: {e}", color="red")
+                # In traceback cho lỗi I/O
+                self._log(traceback.format_exc(), color="red")
+                record_file = None # Đặt lại file thành None nếu có lỗi
 
-        # YIELD TEXT METADATA ĐỂ GHI VÀO CHAT BOX
-        # Format: (False, {'user_text': transcript, 'bot_text': response})
-        yield (False, {"user_text": full_transcript, "bot_text": response_text})
+            # **********************************************
+            # 2. Xử lý ASR, NLU, TTS (Chỉ chạy nếu có file)
+            # **********************************************
+            if record_file and os.path.exists(record_file):
+                # 2. Xử lý ASR
+                asr_stream = self._asr_client.transcribe(record_file)
+                async for partial_text in asr_stream:
+                     if partial_text:
+                         full_transcript = partial_text
 
-        # 4. TTS và Trả về Luồng Audio
-        tts_audio_stream = self._tts_client.synthesize(response_text)
+                # 3. NLU/Response Logic - TÍCH HỢP DIALOG MANAGER
+                if full_transcript.strip():
+                    dm_result = self._dm.process_audio_path(str(record_file), user_input_asr=full_transcript)
+                else:
+                    dm_result = self._dm.process_audio_path(str(record_file), user_input_asr="[NO SPEECH DETECTED]")
+                    dm_result['response_text'] = "Xin lỗi, tôi không nghe rõ. Bạn có thể nói lại không?"
+                    
+                response_text = dm_result.get("response_text", response_text)
+                
+                self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🧠 [DM] Transcript: '{full_transcript[:30]}...' -> Response: '{response_text[:30]}...'", color="green")
+
+                # YIELD TEXT METADATA ĐỂ GHI VÀO CHAT BOX
+                yield (False, {"user_text": full_transcript, "bot_text": response_text})
+
+                # 4. TTS và Trả về Luồng Audio
+                tts_audio_stream = self._tts_client.synthesize_stream(response_text)
+                
+                # YIELD AUDIO CHUNKS
+                async for audio_chunk in tts_audio_stream:
+                    yield (True, audio_chunk)
         
-        # YIELD AUDIO CHUNKS
-        # Format: (True, audio_chunk_bytes)
-        async for chunk in tts_audio_stream:
-             yield (True, chunk) 
-        
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🏁 [RTC] Phiên hoàn tất.", color="cyan")
+        except Exception as e:
+            # Bắt các lỗi không lường trước xảy ra trong quá trình ASR/NLU/TTS
+            self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [RTC] LỖI XỬ LÝ CHUNG: {e}", color="red")
+            self._log(traceback.format_exc(), color="red")
+
+        # ⚠️ KHỐI FINALLY: Đảm bảo luồng dọn dẹp chạy
+        finally: 
+             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] [RTC] Kết thúc xử lý RTC. (File: {record_file.name if record_file else 'None'})", color="cyan")

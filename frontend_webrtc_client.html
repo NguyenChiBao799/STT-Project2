@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice AI Assistant (WebRTC)</title>
+    <style>
+        /* CSS Styles */
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            background-color: #f4f7f6;
+            color: #333;
+        }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            background: #fff;
+            padding: 25px; 
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #007bff;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        button {
+            padding: 12px 25px;
+            font-size: 16px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+            margin: 5px;
+            flex: 1;
+        }
+        #start-button {
+            background-color: #28a745;
+            color: white;
+        }
+        #start-button:hover:not(:disabled) {
+            background-color: #218838;
+            transform: scale(1.02);
+        }
+        #stop-button {
+            background-color: #dc3545;
+            color: white;
+        }
+        #stop-button:hover:not(:disabled) {
+            background-color: #c82333;
+            transform: scale(1.02);
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+            color: #ccc;
+        }
+        #chat-log {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 8px;
+            background-color: #e9ecef;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            border-radius: 6px;
+        }
+        .user-msg {
+            text-align: right;
+            background-color: #d1e7dd;
+            margin-left: 20%;
+        }
+        .bot-msg {
+            text-align: left;
+            background-color: #f8d7da;
+            margin-right: 20%;
+        }
+        #status {
+            margin-top: 10px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .api-config input {
+             box-sizing: border-box; 
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>🗣️ Voice AI Assistant</h1>
+
+        <div class="api-config" style="margin-bottom: 20px;">
+            <label for="apiKeyInput" style="display: block; margin-bottom: 5px; font-weight: bold;">API Key (Gemini/LLM):</label>
+            <input type="text" id="apiKeyInput" placeholder="Nhập API Key (MOCK nếu để trống)" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
+        </div>
+        
+        <div id="controls">
+            <button id="start-button">Bắt Đầu Ghi Âm</button>
+            <button id="stop-button" disabled>Dừng Ghi Âm</button>
+        </div>
+
+        <p id="status">Trạng thái: Sẵn sàng</p>
+
+        <audio id="remote-audio" autoplay style="display: none;"></audio>
+        
+        <div id="chat-log">
+            <div class="message bot-msg"><strong>Bot:</strong> Chào bạn, tôi có thể giúp gì cho bạn? (Đang chờ kết nối...)</div>
+        </div>
+    </div>
+
+    <script>
+        const START_BUTTON = document.getElementById('start-button');
+        const STOP_BUTTON = document.getElementById('stop-button');
+        const STATUS_ELEM = document.getElementById('status');
+        const CHAT_LOG = document.getElementById('chat-log');
+        const REMOTE_AUDIO = document.getElementById('remote-audio');
+        const API_KEY_INPUT = document.getElementById('apiKeyInput'); 
+        const SERVER_URL = ""; // Để trống hoặc dùng http://127.0.0.1:8000
+        
+        let pc = null; 
+        let localStream = null; 
+        let dataChannel = null;
+
+        // ==================== UI LOGIC ====================
+
+        function setStatus(message, isError = false) {
+            STATUS_ELEM.textContent = `Trạng thái: ${message}`;
+            STATUS_ELEM.style.color = isError ? '#dc3545' : '#007bff';
+        }
+
+        function addMessageToLog(sender, text) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${sender}-msg`;
+            msgDiv.innerHTML = `<strong>${sender === 'user' ? 'Bạn' : 'Bot'}:</strong> ${text}`;
+            CHAT_LOG.appendChild(msgDiv);
+            CHAT_LOG.scrollTop = CHAT_LOG.scrollHeight;
+        }
+        
+        // ==================== WEBRTC LOGIC ====================
+
+        async function startRecording() {
+            if (pc) {
+                await closeConnection(false);
+            }
+
+            setStatus("Đang kết nối tới AI...");
+            START_BUTTON.disabled = true;
+
+            try {
+                // 1. Lấy Stream từ Microphone (Input) - BƯỚC KHẮC PHỤC LỖI "KO CÓ LOG"
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                console.log("✅ Đã lấy được Micro phone stream.");
+                
+                setStatus("🎤 Đang nghe... (Click Dừng để gửi)");
+
+                // 2. Khởi tạo RTCPeerConnection
+                pc = new RTCPeerConnection();
+
+                // Xử lý sự kiện thay đổi trạng thái kết nối
+                pc.onconnectionstatechange = (event) => {
+                    console.log(`Connection state change: ${pc.connectionState}`);
+                    if (pc.connectionState === 'failed') {
+                        setStatus("Kết nối WebRTC thất bại.", true);
+                        closeConnection(false);
+                    } 
+                    if (pc.connectionState === 'connected') {
+                        // Kích hoạt nút Stop khi kết nối thành công (nhưng vẫn có thể kích hoạt sớm hơn)
+                        STOP_BUTTON.disabled = false;
+                    }
+                };
+
+                // Xử lý luồng Audio TTS từ Backend
+                pc.ontrack = (event) => {
+                    if (event.track.kind === 'audio') {
+                        console.log("🔊 Nhận được Audio Track TTS từ Bot.");
+                        
+                        setStatus("🔊 Đang phát phản hồi...");
+
+                        // LOGIC ĐÓNG KẾT NỐI AN TOÀN SAU KHI TTS CHẠY XONG
+                        event.track.onended = () => {
+                            console.log("✅ Luồng TTS từ Bot đã kết thúc! Tiến hành đóng kết nối an toàn.");
+                            setTimeout(() => {
+                                closeConnection(true); 
+                            }, 100); 
+                        };
+
+                        // 3. Gán Stream Audio TTS (remoteStream) cho thẻ <audio> để phát
+                        const remoteStream = event.streams[0];
+                        REMOTE_AUDIO.srcObject = remoteStream;
+                        REMOTE_AUDIO.play().catch(e => console.error("Lỗi phát audio:", e));
+                    }
+                };
+
+                // 4. Thêm track microphone vào PeerConnection
+                localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                STOP_BUTTON.disabled = false; 
+
+                // 5. Tạo Offer SDP
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                // 6. Gửi Offer đến Server Backend (Bao gồm API Key)
+                const apiKey = API_KEY_INPUT.value.trim(); 
+                
+                console.log("➡️ Gửi Offer SDP tới Backend...");
+                const response = await fetch(`${SERVER_URL}/offer`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type,
+                        api_key: apiKey, 
+                    }),
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Server returned status: ${response.status}. Chi tiết: ${errorText}`);
+                }
+
+                const answer = await response.json();
+                console.log("⬅️ Nhận Answer SDP từ Backend.");
+
+                // 7. Thiết lập Answer SDP từ Server
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                
+                // 8. Chờ Data Channel để nhận Metadata (Text)
+                pc.ondatachannel = (event) => {
+                    dataChannel = event.channel;
+                    dataChannel.onmessage = (e) => {
+                        try {
+                            const data = JSON.parse(e.data);
+                            addMessageToLog('user', data.user_text || '...');
+                            addMessageToLog('bot', data.bot_text || '...');
+                        } catch (err) {
+                            console.error("Lỗi xử lý Data Channel Message:", err);
+                        }
+                    };
+                };
+
+            } catch (error) {
+                console.error("❌ Lỗi khởi tạo WebRTC:", error);
+                
+                // XỬ LÝ LỖI MICROPHONE PHỔ BIẾN
+                if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                    setStatus("LỖI MICROPHONE: Bạn phải **cho phép** trình duyệt truy cập Microphone.", true);
+                } else if (error.message.includes("Server returned status")) {
+                    setStatus(`LỖI SERVER: ${error.message}. Kiểm tra Terminal Backend.`, true);
+                } else {
+                    setStatus(`Lỗi không xác định: ${error.message}`, true);
+                }
+                
+                closeConnection(false); 
+            }
+        }
+
+        async function closeConnection(isSafeClose = false) {
+            
+            // 1. Tắt Microphone
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            // 2. Dừng phát audio
+            if (REMOTE_AUDIO.srcObject) {
+                 REMOTE_AUDIO.pause();
+                 REMOTE_AUDIO.srcObject = null;
+            }
+
+            // 3. Đóng RTCPeerConnection
+            if (pc && pc.connectionState !== 'closed' && pc.connectionState !== 'disconnected') {
+                try {
+                    await pc.close();
+                } catch (e) {
+                    console.error("Lỗi khi đóng PC:", e);
+                }
+            }
+            pc = null;
+            dataChannel = null;
+            
+            // 4. Cập nhật UI
+            START_BUTTON.disabled = false;
+            STOP_BUTTON.disabled = true;
+            if (isSafeClose) {
+                setStatus("Phản hồi hoàn tất. Sẵn sàng.", false);
+            } else {
+                 if (!STATUS_ELEM.textContent.includes("LỖI")) {
+                    setStatus("Đã dừng. Sẵn sàng.", false);
+                 }
+            }
+        }
+        
+        // ==================== EVENT LISTENERS VÀ LOCAL STORAGE ====================
+
+        START_BUTTON.addEventListener('click', startRecording);
+        STOP_BUTTON.addEventListener('click', closeConnection);
+        
+        // Khôi phục/Lưu API Key từ Local Storage
+        window.onload = function() {
+            const savedKey = localStorage.getItem('voice_ai_api_key');
+            if (savedKey) {
+                API_KEY_INPUT.value = savedKey;
+            } 
+            setStatus("Sẵn sàng.", false);
+        };
+
+        API_KEY_INPUT.addEventListener('change', () => {
+            const key = API_KEY_INPUT.value.trim();
+            localStorage.setItem('voice_ai_api_key', key);
+            setStatus("API Key đã được lưu tạm thời.", false);
+        });
+        
+        window.addEventListener('beforeunload', closeConnection); 
+
+    </script>
+</body>
+</html>

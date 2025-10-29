@@ -13,15 +13,21 @@ except Exception:
 class ConfigDB:
     # --- API KEYS & MODES ---
     API_KEY = os.environ.get("YOUR_API_KEY_ENV_VAR", "MOCK_API_KEY") 
-    NLU_MODE_DEFAULT = "LLM"      
-    ASR_MODE_DEFAULT = "WHISPER"  
-    LLM_MODE_DEFAULT = "GEMINI"   
-    DB_MODE_DEFAULT = "CORPORATE_API"
+    
+    # CHẾ ĐỘ XỬ LÝ (ĐÃ CẬP NHẬT ASR MODE sang WHISPER)
+    NLU_MODE_DEFAULT = "MOCK"      
+    ASR_MODE_DEFAULT = "WHISPER"   
+    LLM_MODE_DEFAULT = "MOCK"   
+    DB_MODE_DEFAULT = "MOCK"
     TTS_MODE_DEFAULT = "MOCK"     
+    
+    # Cài đặt LLM
+    GEMINI_MODEL = "gemini-2.5-flash" # ⬅️ Cần export
+    
     TTS_VOICE_NAME_DEFAULT = "vi-VN-Standard-A"
 
     # --- CONFIG ASR/NLU ---
-    WHISPER_MODEL_NAME = "small" 
+    WHISPER_MODEL_NAME = "small" # ⬅️ Mô hình 'small' theo yêu cầu.
     NLU_CONFIDENCE_THRESHOLD = 0.6 
     
     # --- CONFIG AUDIO IO ---
@@ -29,34 +35,20 @@ class ConfigDB:
     CHANNELS = 1
     CHUNK_SIZE = 1024       
 
-    # --- FILE PATHS ---
+    # --- FILE PATHS & PORTS ---
     AUDIO_FILE = "temp/asr_input.wav"
     TEMP_TTS_FILE = "temp/tts_response.wav" 
-    LOG_FILE_PATH = "logs/application.log"
-    CONFIG_FILE = "config.json"
+    LOG_FILE_PATH = "logs/app_log.txt"
+    PROMETHEUS_PORT = 8000 
 
-    # --- DIALOG & STATE ---
-    INITIAL_STATE = "START"
-    PROMETHEUS_PORT = 8000
-    
-    # --- MOCK DATA FOR STATS/SALES ---
-    MOCK_STATS = {
-        "total_requests": 1540,
-        "conversion_rate": 0.125,
-        "products_mentioned": {"Product A (Phone)": 320, "Product B (Laptop)": 250, "Product C (Service)": 180, "Product D (Accessory)": 100},
-        "sales_data": [
-            {"date": "2025-10-01", "sales": 15000000, "conversion_rate": 0.10},
-            {"date": "2025-10-02", "sales": 18000000, "conversion_rate": 0.12},
-            {"date": "2025-10-03", "sales": 14000000, "conversion_rate": 0.09}
-        ]
-    }
-    
-    # --- SCENARIO CONFIGS (UPDATED FOR CRUD) ---
+    # --- CONFIG SCENARIOS (Dữ liệu Mock/Template) ---
     SCENARIOS_CONFIG = {
         "intents": [
-            {"intent_name": "query_weather", "responses": ["Thời tiết tại Hà Nội hôm nay là 25 độ, có mưa rào."], "products": []},
-            {"intent_name": "order_product", "responses": ["Xin quý khách cho biết mã sản phẩm muốn đặt. Sản phẩm A và B đang được khuyến mãi."], "products": ["Product A (Phone)", "Product B (Laptop)"]},
-            {"intent_name": "query_promotion", "responses": ["Khuyến mãi tháng này là giảm 20% cho Product C."], "products": ["Product C (Service)"]}
+            {"intent_name": "query_order", "responses": ["Đã tìm thấy yêu cầu đặt đơn hàng. Bạn muốn sản phẩm nào?"], "products": []},
+            {"intent_name": "query_weather", "responses": ["Thời tiết tại Hà Nội hôm nay là 25 độ, có mưa rào."], "products": []}
+        ],
+        "products": [
+            {"name": "Sản phẩm A", "id": "A123", "price": "100.000 VNĐ"},
         ]
     }
     
@@ -67,14 +59,20 @@ class ConfigDB:
 # ======================================================
 # HẰNG SỐ DỰ ÁN (EXPORTING FOR DIRECT IMPORT)
 # ======================================================
-# ... (Phần export giữ nguyên)
+# Sử dụng ConfigDB để export các hằng số
 API_KEY = ConfigDB.API_KEY 
+GEMINI_MODEL = ConfigDB.GEMINI_MODEL # ⬅️ ĐÃ THÊM: Export GEMINI_MODEL
 LLM_MODE_DEFAULT = ConfigDB.LLM_MODE_DEFAULT 
 NLU_MODE_DEFAULT = ConfigDB.NLU_MODE_DEFAULT
 DB_MODE_DEFAULT = ConfigDB.DB_MODE_DEFAULT
 ASR_MODE_DEFAULT = ConfigDB.ASR_MODE_DEFAULT
 TTS_MODE_DEFAULT = ConfigDB.TTS_MODE_DEFAULT
 TTS_VOICE_NAME_DEFAULT = ConfigDB.TTS_VOICE_NAME_DEFAULT
+
+# FIX LỖI IMPORT: Export STATE_CONFIG, PRIORITY_RULES và SCENARIOS_CONFIG
+SCENARIOS_CONFIG = ConfigDB.SCENARIOS_CONFIG
+STATE_CONFIG = ConfigDB.STATE_CONFIG
+PRIORITY_RULES = ConfigDB.PRIORITY_RULES
 
 # Lists for UI
 LLM_MODES = ["API", "MOCK"]
@@ -88,19 +86,7 @@ TEMP_TTS_FILE = ConfigDB.TEMP_TTS_FILE
 LOG_FILE_PATH = ConfigDB.LOG_FILE_PATH
 NLU_CONFIDENCE_THRESHOLD = ConfigDB.NLU_CONFIDENCE_THRESHOLD
 WHISPER_MODEL_NAME = ConfigDB.WHISPER_MODEL_NAME
-PROMETHEUS_PORT = ConfigDB.PROMETHEUS_PORT
-CONFIG_FILE = ConfigDB.CONFIG_FILE
-
-# Audio IO Configs
 SAMPLE_RATE = ConfigDB.SAMPLE_RATE
 CHANNELS = ConfigDB.CHANNELS
 CHUNK_SIZE = ConfigDB.CHUNK_SIZE
-
-# Dialog/State
-INITIAL_STATE = ConfigDB.INITIAL_STATE 
-SCENARIOS_CONFIG = ConfigDB.SCENARIOS_CONFIG # ✅ EXPORT MỚI
-STATE_CONFIG = ConfigDB.STATE_CONFIG
-PRIORITY_RULES = ConfigDB.PRIORITY_RULES
-
-# MOCK STATS
-MOCK_STATS = ConfigDB.MOCK_STATS # ✅ EXPORT MỚI
+PROMETHEUS_PORT = ConfigDB.PROMETHEUS_PORT
