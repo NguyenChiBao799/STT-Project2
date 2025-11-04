@@ -14,297 +14,343 @@
         #stopBtn:hover, #cancelBtn:hover { background-color: #c82333; }
         #cancelBtn { display: none; }
         .result-panel { margin-top: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; background-color: #fff; }
-        #logArea { height: 200px; overflow-y: scroll; border: 1px solid #eee; padding: 10px; margin-top: 10px; font-size: 14px; background-color: #f9f9f9; }
-        .log-error { color: red; }
-        .log-status { color: blue; }
-        .log-response { color: darkgreen; font-weight: bold; }
-        audio { width: 100%; margin-top: 10px; }
-        input[type="text"] { width: 100%; padding: 8px; margin-bottom: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
+        #log-area, #asrResult, #botResponse { white-space: pre-wrap; word-wrap: break-word; min-height: 20px; padding: 5px; border-bottom: 1px solid #eee; }
+        #log-area { max-height: 250px; overflow-y: scroll; font-size: 0.85em; background-color: #f9f9f9; }
+        .log-status { color: #007bff; }
+        .log-error { color: #dc3545; font-weight: bold; }
+        .log-warn { color: #ffc107; }
+        .status-bar { height: 10px; background-color: #e9ecef; border-radius: 5px; margin-top: 10px; overflow: hidden; }
+        .status-progress { height: 100%; width: 0%; background-color: #007bff; transition: width 0.5s; }
+        .api-key-config { margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; }
+        .api-key-config label { font-weight: bold; display: block; margin-bottom: 5px; }
+        .api-key-config input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Voice AI Assistant</h1>
-        
-        <input type="text" id="apiKeyInput" placeholder="Nhập API Key (Nếu cần)" />
+        <h1>Voice AI Assistant (WebRTC)</h1>
+
+        <div class="api-key-config">
+            <label for="apiKeyInput">API Key (Tùy chọn):</label>
+            <input type="text" id="apiKeyInput" placeholder="Nhập API Key nếu cần">
+        </div>
 
         <div class="control-panel">
-            <button id="startBtn" disabled>🎤 Bắt đầu Ghi Âm</button>
+            <button id="startBtn" disabled>▶️ Bắt Đầu Ghi Âm</button>
             <button id="stopBtn" disabled>⏹️ Dừng & Xử Lý</button>
-            <button id="cancelBtn">❌ Hủy Xử Lý</button>
+            <button id="cancelBtn" disabled>❌ Hủy Xử Lý</button>
+        </div>
+
+        <div class="status-bar">
+            <div id="statusProgress" class="status-progress"></div>
         </div>
 
         <div class="result-panel">
-            <h2>Trạng thái: <span id="statusText" class="log-status">Đang khởi tạo...</span></h2>
-            <p><strong>ASR (Bạn nói):</strong> <span id="asrText">...</span></p>
-            <p><strong>Phản hồi (AI):</strong> <span id="responseText">...</span></p>
+            <h2>Kết Quả Xử Lý</h2>
+            <p><strong>ASR (Người Dùng):</strong> <span id="asrResult">...</span></p>
+            <p><strong>Phản Hồi (Bot):</strong> <span id="botResponse">...</span></p>
             <audio id="ttsAudio" controls autoplay></audio>
         </div>
-        
-        <h2>Log Sự Kiện</h2>
-        <div id="logArea"></div>
+
+        <div class="result-panel">
+            <h2>Log Hệ Thống</h2>
+            <div id="log-area"></div>
+        </div>
     </div>
 
     <script>
-        // =====================================================
-        // GLOBAL VARIABLES
-        // =====================================================
-        let pc = null;
-        let localStream = null;
-        let dataChannel = null;
+        // ======================================================
+        // CÁC BIẾN TOÀN CỤC
+        // ======================================================
+        let pc; 
+        let localStream;
+        let dataChannel;
+        let isProcessing = false;
+        let sessionID = '';
+        
+        const WS_URL = "ws://localhost:8000/ws"; 
+        let ws;
+
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const cancelBtn = document.getElementById('cancelBtn');
-        const apiKeyInput = document.getElementById('apiKeyInput');
-        const statusText = document.getElementById('statusText');
-        const asrText = document.getElementById('asrText');
-        const responseText = document.getElementById('responseText');
+        const logArea = document.getElementById('log-area');
         const ttsAudio = document.getElementById('ttsAudio');
-        const logArea = document.getElementById('logArea');
-        
-        // =====================================================
-        // UTILITY FUNCTIONS
-        // =====================================================
-        function log(message, type = 'default') {
+        const asrResult = document.getElementById('asrResult');
+        const botResponse = document.getElementById('botResponse');
+        const statusProgress = document.getElementById('statusProgress');
+        const apiKeyInput = document.getElementById('apiKeyInput');
+
+        // ======================================================
+        // CÁC HÀM TRỢ GIÚP
+        // ======================================================
+
+        function log(message, type = 'log') {
             const time = new Date().toLocaleTimeString();
             const logEntry = document.createElement('div');
             logEntry.innerHTML = `[${time}] ${message}`;
-            
-            if (type === 'error') logEntry.classList.add('log-error');
-            else if (type === 'status') logEntry.classList.add('log-status');
-            else if (type === 'response') logEntry.classList.add('log-response');
-
-            logArea.appendChild(logEntry);
-            logArea.scrollTop = logArea.scrollHeight; // Auto-scroll to bottom
+            logEntry.className = `log-${type}`;
+            logArea.prepend(logEntry); 
         }
 
-        function updateStatus(message, isProcessing) {
-            statusText.textContent = message;
-            statusText.style.color = isProcessing ? 'orange' : 'blue';
-            if (isProcessing) {
-                responseText.textContent = 'Đang xử lý...';
-            }
+        function updateStatus(message, percent = 0) {
+            log(message, 'status');
+            statusProgress.style.width = `${percent}%`;
+        }
+
+        function resetUI() {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            cancelBtn.style.display = 'none';
+            asrResult.textContent = '...';
+            botResponse.textContent = '...';
+            statusProgress.style.width = '0%';
+            ttsAudio.removeAttribute('src');
+            isProcessing = false;
         }
         
-        function updateUI(isRecording) {
-            startBtn.disabled = isRecording;
-            stopBtn.disabled = !isRecording;
-            cancelBtn.style.display = 'none'; // Chỉ hiện cancel khi xử lý bắt đầu
-            if (isRecording) {
-                asrText.textContent = 'Đang lắng nghe...';
-                responseText.textContent = '...';
-                ttsAudio.removeAttribute('src');
-                updateStatus('Đang ghi âm.', true);
-            } else {
-                updateStatus('Sẵn sàng.', false);
-            }
-        }
-        
-        // =====================================================
-        // WEB RTC LOGIC
-        // =====================================================
-        
-        async function createPeerConnection() {
-            if (pc) {
-                // Đóng kết nối cũ nếu có
-                try { await pc.close(); } catch (e) {}
+        // ======================================================
+        // LÔGIC KHỞI TẠO WEBSOCKET
+        // ======================================================
+        function initWebSocket() {
+            // FIX: Đóng kết nối WS cũ nếu có
+            if (ws && ws.readyState !== WebSocket.CLOSED) {
+                ws.close();
             }
             
-            pc = new RTCPeerConnection();
+            // Kết nối WS mới, sử dụng sessionID mới
+            ws = new WebSocket(`${WS_URL}?session_id=${sessionID}`);
             
-            // 1. Gán sự kiện Data Channel
-            dataChannel = pc.createDataChannel("data-channel");
-            dataChannel.onopen = () => {
-                log("Data Channel đã mở.");
-            };
-            dataChannel.onmessage = handleDataChannelMessage;
-            dataChannel.onclose = () => {
-                log("Data Channel đã đóng.");
-                // Nếu data channel đóng mà PC không đóng, xử lý kết thúc
-                if (pc && pc.connectionState !== 'closed') {
-                     log("PC vẫn mở, tắt PC.", 'status');
-                     pc.close();
-                }
+            ws.onopen = () => {
+                log("WebSocket đã kết nối thành công.", 'status');
             };
 
-            // 2. Thêm Media Track (Audio)
-            localStream.getTracks().forEach(track => {
-                pc.addTrack(track, localStream);
-                log(`Thêm track: ${track.kind}`);
-            });
-
-            // 3. Xử lý Candidate và Negotiation
-            pc.onicecandidate = ({ candidate }) => {
-                if (candidate) {
-                    // Cần có logic để gửi candidate nếu bạn muốn hỗ trợ NAT traversal
-                    // Hiện tại bỏ qua vì client/server cùng localhost
-                }
+            ws.onerror = (error) => {
+                log(`Lỗi WebSocket: ${error.message || error}`, 'error');
             };
 
-            pc.oniceconnectionstatechange = () => {
-                log(`Trạng thái ICE: ${pc.iceConnectionState}`);
+            ws.onclose = (event) => {
+                log(`WebSocket đã đóng. Code: ${event.code}.`, 'error');
             };
-
-            pc.onconnectionstatechange = () => {
-                log(`Trạng thái kết nối: ${pc.connectionState}`);
-                if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-                    // ✅ FIX: Đảm bảo UI được cập nhật khi kết nối đóng
-                    if (stopBtn.disabled === false) { 
-                        log('Kết nối WebRTC bị đóng bất ngờ.', 'error');
-                        updateUI(false);
+            
+            ws.onmessage = async (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    if (message.type === 'candidate') {
+                        // Thêm ICE Candidate chỉ khi pc đã được tạo
+                        if (pc) {
+                            await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                        }
                     }
+                } catch (e) {
+                    // Bỏ qua nếu không phải JSON
                 }
             };
-            
-            // 4. Tạo Offer và Gửi Offer đến Backend
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            
-            log("Gửi Offer đến Backend...");
-            const response = await fetch('/offer', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    sdp: pc.localDescription.sdp, 
-                    type: pc.localDescription.type,
-                    api_key: apiKeyInput.value.trim() 
-                })
-            });
-
-            if (!response.ok) {
-                log(`Lỗi từ Backend: ${response.statusText}`, 'error');
-                stopRecording(); // Tự động đóng kết nối
-                return;
-            }
-
-            const answer = await response.json();
-            await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            
-            log("WebRTC Answer đã được xử lý. Bắt đầu ghi âm.");
-            updateUI(true);
         }
         
-        function handleDataChannelMessage(event) {
+        // ======================================================
+        // LÔGIC XỬ LÝ MEDIA (WEBRTC)
+        // ======================================================
+
+        function createPeerConnection() {
+            resetUI();
+            sessionID = crypto.randomUUID();
+            updateStatus('Bắt đầu thiết lập WebRTC...', 10);
+            
+            // ✅ FIX LỖI ROUTING: Khởi tạo WebSocket ngay bây giờ
+            initWebSocket();
+
+            const configuration = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:global.stun.twilio.com:3478' }
+                ]
+            };
+
             try {
-                const data = JSON.parse(event.data);
+                pc = new RTCPeerConnection(configuration);
                 
-                if (data.type === 'metadata') {
-                    if (data.status === 'ASR_COMPLETE') {
-                        asrText.textContent = data.transcript;
-                        log(`[ASR] Hoàn tất: ${data.transcript}`, 'status');
-                        cancelBtn.style.display = 'inline-block'; // Có thể hủy xử lý DM/TTS
-                        updateStatus('Đang xử lý DM/TTS...', true);
-                    } else if (data.status === 'DM_COMPLETE') {
-                        responseText.textContent = data.response_text;
-                        log(`[DM] Phản hồi: ${data.response_text}`, 'response');
-                        cancelBtn.style.display = 'none';
-                    } else if (data.status === 'TTS_START') {
-                         log('[TTS] Bắt đầu streaming audio.', 'status');
-                    } else if (data.status === 'TTS_END') {
-                         log('[TTS] Kết thúc streaming audio.', 'status');
+                // === HANDLERS CHO PC ===
+                
+                pc.onicecandidate = ({ candidate }) => {
+                    if (candidate) {
+                        // Chỉ gửi candidate khi WS đã mở
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'candidate',
+                                candidate: candidate.toJSON(),
+                                session_id: sessionID
+                            }));
+                        }
                     }
-                } else if (data.type === 'audio_chunk') {
-                    // Xử lý chunk audio (Base64)
-                    playAudioChunk(data.chunk);
-                } else if (data.type === 'cancelled') {
-                    log('Xử lý đã bị HỦY bởi Backend.', 'error');
-                    updateUI(false);
-                } else if (data.type === 'error') {
-                    log(`LỖI Xử Lý: ${data.message}`, 'error');
-                    updateUI(false);
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                    log(`Trạng thái ICE: ${pc.iceConnectionState}`, 'status');
+                    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                        log('Kết nối WebRTC bị đóng bất ngờ.', 'error');
+                    }
+                };
+                
+                pc.onconnectionstatechange = () => {
+                    log(`Trạng thái kết nối: ${pc.connectionState}`, 'status');
+                    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                         log('Kết nối WebRTC thất bại/đóng.', 'error');
+                         resetUI();
+                    }
+                };
+
+
+                // === HANDLERS CHO DATA CHANNEL ===
+                dataChannel = pc.createDataChannel("data-channel");
+                
+                dataChannel.onopen = () => {
+                    updateStatus('Data Channel đã mở. Bắt đầu ghi âm...', 30);
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                };
+
+                dataChannel.onclose = () => {
+                    log('Data Channel đã đóng.', 'status');
+                };
+
+                dataChannel.onmessage = handleDataChannelMessage;
+
+                // Thêm Media Track
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+
+                // Tạo Offer và gửi đến Server
+                pc.createOffer().then(offer => {
+                    return pc.setLocalDescription(offer);
+                }).then(() => {
+                    const offer = pc.localDescription;
+                    const api_key = apiKeyInput.value.trim();
+                    
+                    // Gửi Offer qua HTTP POST
+                    return fetch('/offer', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            sdp: offer.sdp,
+                            type: offer.type,
+                            session_id: sessionID,
+                            api_key: api_key 
+                        })
+                    });
+                }).then(response => response.json()).then(async answer => {
+                    // Nhận Answer từ Server
+                    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                    updateStatus('Kết nối WebRTC đã thiết lập. Đang chờ Data Channel mở.', 50);
+                }).catch(error => {
+                    log(`Lỗi thiết lập WebRTC: ${error}`, 'error');
+                    resetUI();
+                });
+
+            } catch (error) {
+                log(`Lỗi PeerConnection: ${error}`, 'error');
+                resetUI();
+            }
+        }
+        
+        // ======================================================
+        // LÔGIC XỬ LÝ DỮ LIỆU
+        // ======================================================
+
+        function handleDataChannelMessage(event) {
+            const data = event.data;
+            try {
+                const message = JSON.parse(data);
+                
+                if (message.type === 'start_processing') {
+                    isProcessing = true;
+                    log('Server: Bắt đầu xử lý ASR/DM.', 'status');
+                    updateStatus('Server: Đang xử lý ASR/NLU...', 60);
+                    cancelBtn.style.display = 'inline-block';
+                    cancelBtn.disabled = false;
+                } else if (message.type === 'text_response') {
+                    log(`Server: Nhận phản hồi văn bản. User: ${message.user_text} | Bot: ${message.bot_text}`, 'status');
+                    asrResult.textContent = message.user_text || '[Không có giọng nói]';
+                    botResponse.textContent = message.bot_text || '[Không có phản hồi]';
+                    updateStatus('Server: Nhận phản hồi. Bắt đầu TTS...', 80);
+                } else if (message.type === 'audio_chunk') {
+                    const audioBase64 = message.chunk;
+                    const audioBlob = base64ToBlob(audioBase64, 'audio/wav');
+                    
+                    ttsAudio.src = URL.createObjectURL(audioBlob);
+                    ttsAudio.play();
+                    
+                    updateStatus('Đang phát audio phản hồi...', 90);
+                } else if (message.type === 'end_of_session') {
+                    log('Server: Kết thúc phiên xử lý.', 'status');
+                    cancelBtn.style.display = 'none';
+                    cancelBtn.disabled = true;
+                    isProcessing = false;
+                } else if (message.type === 'error') {
+                    log(`Server LỖI: ${message.error}`, 'error');
+                    resetUI();
                 }
 
             } catch (e) {
-                // Log nếu không phải JSON (có thể là chunk audio thô)
-                // Hiện tại ta dùng JSON {"type": "audio_chunk", "chunk": "..."}
                 log(`Lỗi xử lý DataChannel: ${e.message}`, 'error');
             }
         }
         
-        const audioQueue = [];
-        let isPlaying = false;
-
-        function playAudioChunk(base64Chunk) {
-            audioQueue.push(base64Chunk);
-            if (!isPlaying) {
-                processQueue();
+        function base64ToBlob(base64, mimeType) {
+            const byteCharacters = atob(base64);
+            const byteArrays = [];
+            for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+                const slice = byteCharacters.slice(offset, offset + 512);
+                const byteNumbers = new Array(slice.length);
+                for (let i = 0; i < slice.length; i++) {
+                    byteNumbers[i] = slice.charCodeAt(i);
+                }
+                const byteArray = new Uint8Array(byteNumbers);
+                byteArrays.push(byteArray);
             }
-        }
-
-        async function processQueue() {
-            if (audioQueue.length === 0) {
-                isPlaying = false;
-                return;
-            }
-
-            isPlaying = true;
-            const chunk = audioQueue.shift();
-            
-            // Chuyển Base64 thành Blob
-            const binaryString = atob(chunk);
-            const len = binaryString.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-            const blob = new Blob([bytes.buffer], { type: 'audio/wav' });
-
-            const audioUrl = URL.createObjectURL(blob);
-            
-            // Tạm thời dùng Audio Element để phát. 
-            // Cần dùng Web Audio API để phát trôi chảy hơn nếu có độ trễ lớn.
-            const audio = new Audio(audioUrl);
-            audio.play();
-
-            audio.onended = () => {
-                URL.revokeObjectURL(audioUrl); // Giải phóng bộ nhớ
-                processQueue(); // Phát chunk tiếp theo
-            };
-            audio.onerror = (e) => {
-                log(`Lỗi phát audio: ${e.message}`, 'error');
-                URL.revokeObjectURL(audioUrl);
-                processQueue();
-            };
+            return new Blob(byteArrays, { type: mimeType });
         }
 
 
+        function stopRecording() {
+            if (pc && pc.connectionState === 'connected') {
+                log('🛑 Yêu cầu Dừng Ghi Âm và Bắt Đầu Xử Lý...', 'status');
+                stopBtn.disabled = true;
+                
+                // Sử dụng dataChannel đã được khởi tạo
+                if (dataChannel && dataChannel.readyState === 'open') {
+                    dataChannel.send(JSON.stringify({ type: 'stop_recording' }));
+                } else {
+                     log('Data Channel chưa sẵn sàng để gửi lệnh dừng.', 'warn');
+                }
+                
+                localStream.getTracks().forEach(track => track.stop());
+                
+                updateStatus('Đã dừng ghi âm. Đang chờ server phản hồi...', 55);
+            }
+        }
+        
         function sendCancelMessage() {
-            if (dataChannel && dataChannel.readyState === 'open') {
-                const cancelMessage = JSON.stringify({ type: 'cancel_processing' });
-                dataChannel.send(cancelMessage);
-                log("Đã gửi lệnh HỦY xử lý.", 'status');
-                cancelBtn.style.display = 'none';
-            }
+             if (dataChannel && dataChannel.readyState === 'open' && isProcessing) {
+                 log('❌ Gửi lệnh HỦY XỬ LÝ đến Server.', 'error');
+                 dataChannel.send(JSON.stringify({ type: 'cancel_processing' }));
+                 resetUI();
+             }
         }
-
-        // ✅ FIX LỖI TREO: Đảm bảo đóng PC và Track để gửi tín hiệu dừng
-        async function stopRecording() {
-            if (!pc || pc.connectionState === 'closed') return;
-
-            log("Đang đóng kết nối WebRTC...", 'status');
-            
-            // 1. Tắt tất cả các track
-            if (localStream) {
-                 localStream.getTracks().forEach(track => track.stop());
-            }
-
-            // 2. Đóng Peer Connection (Bắt buộc để gửi tín hiệu dừng)
-            try {
-                pc.close();
-            } catch (e) {
-                log(`Lỗi khi đóng PC: ${e.message}`, 'error');
-            }
-
-            // 3. Cập nhật UI
-            updateUI(false);
-            pc = null;
-        }
-
+        
+        // ======================================================
+        // LÔGIC KHỞI TẠO MICRO
+        // ======================================================
+        
         async function init() {
             if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
                 try {
+                    // Chỉ khởi tạo Local Stream
                     localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    log('Truy cập Micro thành công.', 'status');
+                    log('Truy cập Micro thành công. Sẵn sàng kết nối.', 'status');
                     startBtn.disabled = false;
                     stopBtn.disabled = true;
                 } catch (e) {
@@ -317,31 +363,36 @@
             }
         }
 
-        // =====================================================
+        // ======================================================
         // EVENT LISTENERS
-        // =====================================================
+        // ======================================================
         startBtn.addEventListener('click', async () => {
+             // Đảm bảo stream đã có
              if (!localStream) {
                  await init();
              }
              if (localStream) {
-                 createPeerConnection();
+                 createPeerConnection(); // Tạo PC và gọi initWebSocket bên trong
              }
         });
         
-        // Gán sự kiện cho nút Dừng Ghi Âm
         stopBtn.addEventListener('click', stopRecording); 
 
-        // Gán sự kiện cho nút Hủy Xử Lý
         cancelBtn.addEventListener('click', sendCancelMessage);
         
-        // Khôi phục/Lưu API Key từ Local Storage
+        ttsAudio.onended = () => {
+             log('[TTS] Kết thúc phát audio.', 'status');
+             updateStatus('Đã xử lý xong. Sẵn sàng cho phiên mới.', 100);
+             resetUI(); 
+        }
+
         window.onload = function() {
+            // Khôi phục/Lưu API Key
             const savedKey = localStorage.getItem('voice_ai_api_key');
             if (savedKey) {
                 apiKeyInput.value = savedKey;
             } 
-            init(); // Khởi tạo Micro khi tải trang
+            init(); // Chỉ init Micro, KHÔNG init WebSocket
         };
 
         apiKeyInput.addEventListener('change', () => {
