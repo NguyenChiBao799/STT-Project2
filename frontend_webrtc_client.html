@@ -14,352 +14,380 @@
         #stopBtn:hover, #cancelBtn:hover { background-color: #c82333; }
         #cancelBtn { display: none; }
         .result-panel { margin-top: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; background-color: #fff; }
-        #log-area, #asrResult, #botResponse { white-space: pre-wrap; word-wrap: break-word; min-height: 20px; padding: 5px; border-bottom: 1px solid #eee; }
-        #log-area { max-height: 250px; overflow-y: scroll; font-size: 0.85em; background-color: #f9f9f9; }
-        .log-status { color: #007bff; }
-        .log-error { color: #dc3545; font-weight: bold; }
-        .log-warn { color: #ffc107; }
-        .status-bar { height: 10px; background-color: #e9ecef; border-radius: 5px; margin-top: 10px; overflow: hidden; }
-        .status-progress { height: 100%; width: 0%; background-color: #007bff; transition: width 0.5s; }
-        .api-key-config { margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; }
-        .api-key-config label { font-weight: bold; display: block; margin-bottom: 5px; }
-        .api-key-config input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; }
+        #log { margin-top: 15px; padding: 10px; background-color: #e9ecef; border-radius: 4px; max-height: 200px; overflow-y: auto; font-size: 0.9em; }
+        #status { text-align: center; font-weight: bold; margin-top: 10px; color: #007bff; }
+        #progressContainer { margin-top: 20px; }
+        progress { width: 100%; height: 25px; }
+        .text-output { margin-top: 10px; padding: 10px; border: 1px dashed #007bff; border-radius: 5px; }
+        .user-text, .bot-text { margin-bottom: 5px; }
+        .user-text { color: #343a40; }
+        .bot-text { color: #007bff; font-weight: bold; }
+        .api-key-panel { margin-top: 20px; padding: 10px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 5px; }
+        .audio-source-panel { margin-top: 20px; padding: 10px; border: 1px solid #ccc; border-radius: 5px; background-color: #f9f9f9; }
+        .audio-source-panel label { margin-right: 15px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Voice AI Assistant (WebRTC)</h1>
 
-        <div class="api-key-config">
-            <label for="apiKeyInput">API Key (Tùy chọn):</label>
-            <input type="text" id="apiKeyInput" placeholder="Nhập API Key nếu cần">
+        <div class="api-key-panel">
+            <label for="apiKeyInput">API Key (Mocked for Demo):</label>
+            <input type="text" id="apiKeyInput" placeholder="Nhập API Key (Không bắt buộc trong demo này)" style="width: 100%;">
+        </div>
+
+        <div class="audio-source-panel">
+            <h2>Chọn nguồn Audio:</h2>
+            <label><input type="radio" name="audioSource" value="mic" checked> Microphone</label>
+            <label><input type="radio" name="audioSource" value="system"> Âm thanh Hệ thống (Cần Chia sẻ Màn hình)</label>
         </div>
 
         <div class="control-panel">
-            <button id="startBtn" disabled>▶️ Bắt Đầu Ghi Âm</button>
+            <button id="startBtn">▶️ Bắt Đầu Ghi Âm</button>
             <button id="stopBtn" disabled>⏹️ Dừng & Xử Lý</button>
-            <button id="cancelBtn" disabled>❌ Hủy Xử Lý</button>
+            <button id="cancelBtn">❌ Hủy Xử Lý</button>
         </div>
 
-        <div class="status-bar">
-            <div id="statusProgress" class="status-progress"></div>
-        </div>
+        <div id="status">Đang chờ kết nối...</div>
 
-        <div class="result-panel">
-            <h2>Kết Quả Xử Lý</h2>
-            <p><strong>ASR (Người Dùng):</strong> <span id="asrResult">...</span></p>
-            <p><strong>Phản Hồi (Bot):</strong> <span id="botResponse">...</span></p>
-            <audio id="ttsAudio" controls autoplay></audio>
+        <div id="progressContainer">
+            <progress id="progressBar" value="0" max="100"></progress>
         </div>
 
         <div class="result-panel">
-            <h2>Log Hệ Thống</h2>
-            <div id="log-area"></div>
+            <h2>Kết Quả:</h2>
+            <div id="textOutput" class="text-output">
+                <div class="user-text"><strong>Người dùng:</strong> </div>
+                <div class="bot-text"><strong>Bot:</strong> </div>
+            </div>
+            <audio id="ttsAudio" controls autoplay style="width: 100%; margin-top: 10px;"></audio>
+            <div id="log"></div>
         </div>
     </div>
 
     <script>
-        // ======================================================
-        // CÁC BIẾN TOÀN CỤC
-        // ======================================================
-        let pc; 
-        let localStream;
-        let dataChannel;
-        let isProcessing = false;
-        let sessionID = '';
-        
-        const WS_URL = "ws://localhost:8000/ws"; 
-        let ws;
-
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const cancelBtn = document.getElementById('cancelBtn');
-        const logArea = document.getElementById('log-area');
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+        const textOutputDiv = document.getElementById('textOutput');
         const ttsAudio = document.getElementById('ttsAudio');
-        const asrResult = document.getElementById('asrResult');
-        const botResponse = document.getElementById('botResponse');
-        const statusProgress = document.getElementById('statusProgress');
+        const progressBar = document.getElementById('progressBar');
         const apiKeyInput = document.getElementById('apiKeyInput');
+        
+        // Nguồn Audio Selection
+        const audioSourceRadios = document.querySelectorAll('input[name="audioSource"]');
+
+
+        let pc = null;
+        let dataChannel = null;
+        let localStream = null;
+        let sessionId = null;
+        let ws = null;
 
         // ======================================================
-        // CÁC HÀM TRỢ GIÚP
+        // CÁC HÀM TIỆN ÍCH
         // ======================================================
-
-        function log(message, type = 'log') {
+        function log(message, type = 'info') {
             const time = new Date().toLocaleTimeString();
-            const logEntry = document.createElement('div');
-            logEntry.innerHTML = `[${time}] ${message}`;
-            logEntry.className = `log-${type}`;
-            logArea.prepend(logEntry); 
+            logDiv.innerHTML = `<span style="color: ${type === 'error' ? 'red' : type === 'status' ? 'green' : 'black'};">[${time}] ${message}</span><br>` + logDiv.innerHTML;
         }
 
-        function updateStatus(message, percent = 0) {
-            log(message, 'status');
-            statusProgress.style.width = `${percent}%`;
+        function updateStatus(message, progressValue = 0) {
+            statusDiv.textContent = message;
+            progressBar.value = progressValue;
         }
 
-        function resetUI() {
+        function resetUI(fullReset = false) {
             startBtn.disabled = false;
             stopBtn.disabled = true;
             cancelBtn.style.display = 'none';
-            asrResult.textContent = '...';
-            botResponse.textContent = '...';
-            statusProgress.style.width = '0%';
-            ttsAudio.removeAttribute('src');
-            isProcessing = false;
+            if (fullReset) {
+                 updateStatus('Sẵn sàng cho phiên mới.', 0);
+                 textOutputDiv.querySelector('.user-text').innerHTML = '<strong>Người dùng:</strong> ';
+                 textOutputDiv.querySelector('.bot-text').innerHTML = '<strong>Bot:</strong> ';
+            }
         }
-        
+
         // ======================================================
-        // LÔGIC KHỞI TẠO WEBSOCKET
+        // WEBSOCKET (cho ICE Candidates)
         // ======================================================
-        function initWebSocket() {
-            // FIX: Đóng kết nối WS cũ nếu có
-            if (ws && ws.readyState !== WebSocket.CLOSED) {
+        function initWebSocket(pc, newSessionId) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.close();
             }
             
-            // Kết nối WS mới, sử dụng sessionID mới
-            ws = new WebSocket(`${WS_URL}?session_id=${sessionID}`);
-            
+            sessionId = newSessionId;
+            const wsUrl = `ws://${window.location.host}/ws?session_id=${sessionId}`;
+            ws = new WebSocket(wsUrl);
+
             ws.onopen = () => {
-                log("WebSocket đã kết nối thành công.", 'status');
+                log('WebSocket đã kết nối thành công.', 'status');
+                pc.onicecandidate = ({ candidate }) => {
+                    if (candidate) {
+                        log(`[WebRTC] Nhận ICE Candidate: ${candidate.type}`);
+                    } else {
+                        log('[WebRTC] Hoàn tất thu thập ICE Candidates.');
+                    }
+                };
+            };
+
+            ws.onclose = () => {
+                log('WebSocket đã đóng.', 'status');
             };
 
             ws.onerror = (error) => {
-                log(`Lỗi WebSocket: ${error.message || error}`, 'error');
-            };
-
-            ws.onclose = (event) => {
-                log(`WebSocket đã đóng. Code: ${event.code}.`, 'error');
-            };
-            
-            ws.onmessage = async (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    if (message.type === 'candidate') {
-                        // Thêm ICE Candidate chỉ khi pc đã được tạo
-                        if (pc) {
-                            await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
-                        }
-                    }
-                } catch (e) {
-                    // Bỏ qua nếu không phải JSON
-                }
+                log(`Lỗi WebSocket: ${error}`, 'error');
             };
         }
         
         // ======================================================
-        // LÔGIC XỬ LÝ MEDIA (WEBRTC)
+        // PEER CONNECTION VÀ SIGNALLING
         // ======================================================
+        async function createPeerConnection() {
+            if (!localStream || localStream.getAudioTracks().length === 0) {
+                 log('❌ Không có luồng audio hợp lệ để bắt đầu.', 'error');
+                 alert('Không có luồng audio hợp lệ để bắt đầu ghi âm. Vui lòng cấp quyền Microphone hoặc chọn Âm thanh Hệ thống.');
+                 return;
+            }
 
-        function createPeerConnection() {
-            resetUI();
-            sessionID = crypto.randomUUID();
-            updateStatus('Bắt đầu thiết lập WebRTC...', 10);
+            if (pc && pc.connectionState !== 'closed') {
+                try {
+                    await pc.close();
+                    log('[WebRTC] Đã đóng Peer Connection cũ.');
+                } catch (e) {
+                     log(`[WebRTC] Lỗi khi đóng PC cũ: ${e.message}`, 'error');
+                }
+            }
             
-            // ✅ FIX LỖI ROUTING: Khởi tạo WebSocket ngay bây giờ
-            initWebSocket();
-
-            const configuration = {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:global.stun.twilio.com:3478' }
-                ]
+            sessionId = crypto.randomUUID();
+            pc = new RTCPeerConnection();
+            
+            // 1. Khởi tạo WebSocket cho phiên mới
+            initWebSocket(pc, sessionId); 
+            
+            pc.onconnectionstatechange = () => {
+                log(`[WebRTC] Trạng thái kết nối: ${pc.connectionState}`);
+                if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                    log('[WebRTC] Kết nối bị ngắt hoặc thất bại.', 'error');
+                    resetUI(true);
+                } else if (pc.connectionState === 'closed') {
+                     log('[WebRTC] Kết nối đã đóng.', 'status');
+                     resetUI(true);
+                }
             };
 
+            // 2. Thêm MediaStreamTrack (audio) từ microphone/hệ thống
+            localStream.getTracks().forEach(track => {
+                 pc.addTrack(track, localStream);
+                 log(`[WebRTC] Đã thêm track ${track.kind} vào Peer Connection.`);
+            });
+            
+            // 3. Tạo Data Channel cho tin nhắn điều khiển
+            dataChannel = pc.createDataChannel("chat");
+            dataChannel.onopen = () => {
+                log('[DataChannel] Đã mở Data Channel.', 'status');
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                updateStatus('🔊 Đang Ghi Âm...', 5);
+                cancelBtn.style.display = 'none'; // Chỉ hiển thị khi đang xử lý
+            };
+
+            dataChannel.onmessage = handleDataChannelMessage;
+            dataChannel.onclose = () => log('[DataChannel] Đã đóng Data Channel.');
+
+            // 4. Tạo Offer và gửi đến Backend
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            
+            updateStatus('Đang thiết lập kết nối WebRTC...', 10);
+            log(`[WebRTC] Đã gửi SDP Offer đến Server. Session ID: ${sessionId}`);
+
             try {
-                pc = new RTCPeerConnection(configuration);
-                
-                // === HANDLERS CHO PC ===
-                
-                pc.onicecandidate = ({ candidate }) => {
-                    if (candidate) {
-                        // Chỉ gửi candidate khi WS đã mở
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({
-                                type: 'candidate',
-                                candidate: candidate.toJSON(),
-                                session_id: sessionID
-                            }));
-                        }
-                    }
-                };
-
-                pc.oniceconnectionstatechange = () => {
-                    log(`Trạng thái ICE: ${pc.iceConnectionState}`, 'status');
-                    if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-                        log('Kết nối WebRTC bị đóng bất ngờ.', 'error');
-                    }
-                };
-                
-                pc.onconnectionstatechange = () => {
-                    log(`Trạng thái kết nối: ${pc.connectionState}`, 'status');
-                    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-                         log('Kết nối WebRTC thất bại/đóng.', 'error');
-                         resetUI();
-                    }
-                };
-
-
-                // === HANDLERS CHO DATA CHANNEL ===
-                dataChannel = pc.createDataChannel("data-channel");
-                
-                dataChannel.onopen = () => {
-                    updateStatus('Data Channel đã mở. Bắt đầu ghi âm...', 30);
-                    startBtn.disabled = true;
-                    stopBtn.disabled = false;
-                };
-
-                dataChannel.onclose = () => {
-                    log('Data Channel đã đóng.', 'status');
-                };
-
-                dataChannel.onmessage = handleDataChannelMessage;
-
-                // Thêm Media Track
-                localStream.getTracks().forEach(track => {
-                    pc.addTrack(track, localStream);
+                const response = await fetch('/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type,
+                        session_id: sessionId
+                    })
                 });
+                
+                if (!response.ok) throw new Error('Server returned non-ok status');
 
-                // Tạo Offer và gửi đến Server
-                pc.createOffer().then(offer => {
-                    return pc.setLocalDescription(offer);
-                }).then(() => {
-                    const offer = pc.localDescription;
-                    const api_key = apiKeyInput.value.trim();
-                    
-                    // Gửi Offer qua HTTP POST
-                    return fetch('/offer', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            sdp: offer.sdp,
-                            type: offer.type,
-                            session_id: sessionID,
-                            api_key: api_key 
-                        })
-                    });
-                }).then(response => response.json()).then(async answer => {
-                    // Nhận Answer từ Server
-                    await pc.setRemoteDescription(new RTCSessionDescription(answer));
-                    updateStatus('Kết nối WebRTC đã thiết lập. Đang chờ Data Channel mở.', 50);
-                }).catch(error => {
-                    log(`Lỗi thiết lập WebRTC: ${error}`, 'error');
-                    resetUI();
-                });
+                const answer = await response.json();
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                updateStatus('Đã thiết lập kết nối WebRTC. Sẵn sàng ghi âm.', 20);
 
-            } catch (error) {
-                log(`Lỗi PeerConnection: ${error}`, 'error');
-                resetUI();
+            } catch (e) {
+                log(`Lỗi Signalling/Offer: ${e.message}`, 'error');
+                updateStatus('❌ Lỗi kết nối Server.', 0);
+                try { await pc.close(); } catch {}
             }
         }
         
-        // ======================================================
-        // LÔGIC XỬ LÝ DỮ LIỆU
-        // ======================================================
-
         function handleDataChannelMessage(event) {
-            const data = event.data;
             try {
-                const message = JSON.parse(data);
+                const data = JSON.parse(event.data);
                 
-                if (message.type === 'start_processing') {
-                    isProcessing = true;
-                    log('Server: Bắt đầu xử lý ASR/DM.', 'status');
-                    updateStatus('Server: Đang xử lý ASR/NLU...', 60);
+                if (data.type === 'start_processing') {
+                    updateStatus('🧠 Server đang Xử lý ASR & NLU...', 40);
+                    stopBtn.disabled = true;
                     cancelBtn.style.display = 'inline-block';
-                    cancelBtn.disabled = false;
-                } else if (message.type === 'text_response') {
-                    log(`Server: Nhận phản hồi văn bản. User: ${message.user_text} | Bot: ${message.bot_text}`, 'status');
-                    asrResult.textContent = message.user_text || '[Không có giọng nói]';
-                    botResponse.textContent = message.bot_text || '[Không có phản hồi]';
-                    updateStatus('Server: Nhận phản hồi. Bắt đầu TTS...', 80);
-                } else if (message.type === 'audio_chunk') {
-                    const audioBase64 = message.chunk;
-                    const audioBlob = base64ToBlob(audioBase64, 'audio/wav');
+                    ttsAudio.removeAttribute('src');
+                    ttsAudio.pause();
+
+                } else if (data.type === 'text_response') {
+                    updateStatus('🎵 Server đang Tổng hợp TTS...', 70);
+                    textOutputDiv.querySelector('.user-text').innerHTML = `<strong>Người dùng:</strong> ${data.user_text || 'Không nhận diện được giọng nói.'}`;
+                    textOutputDiv.querySelector('.bot-text').innerHTML = `<strong>Bot:</strong> ${data.bot_text}`;
+
+                } else if (data.type === 'audio_chunk') {
+                    appendAudioChunk(data.chunk);
+
+                } else if (data.type === 'end_of_session') {
+                    updateStatus('✅ Xử lý hoàn tất. Đang phát audio...', 100);
+                    finalizeAudio();
                     
-                    ttsAudio.src = URL.createObjectURL(audioBlob);
-                    ttsAudio.play();
-                    
-                    updateStatus('Đang phát audio phản hồi...', 90);
-                } else if (message.type === 'end_of_session') {
-                    log('Server: Kết thúc phiên xử lý.', 'status');
-                    cancelBtn.style.display = 'none';
-                    cancelBtn.disabled = true;
-                    isProcessing = false;
-                } else if (message.type === 'error') {
-                    log(`Server LỖI: ${message.error}`, 'error');
-                    resetUI();
+                } else if (data.type === 'error') {
+                    log(`LỖI XỬ LÝ SERVER: ${data.error}`, 'error');
+                    updateStatus('❌ Lỗi Server. Vui lòng thử lại.', 0);
+                    resetUI(true);
                 }
 
             } catch (e) {
-                log(`Lỗi xử lý DataChannel: ${e.message}`, 'error');
+                log(`Lỗi phân tích JSON từ Data Channel: ${e.message}`, 'error');
             }
         }
         
-        function base64ToBlob(base64, mimeType) {
-            const byteCharacters = atob(base64);
-            const byteArrays = [];
-            for (let offset = 0; offset < byteCharacters.length; offset += 512) {
-                const slice = byteCharacters.slice(offset, offset + 512);
-                const byteNumbers = new Array(slice.length);
-                for (let i = 0; i < slice.length; i++) {
-                    byteNumbers[i] = slice.charCodeAt(i);
-                }
-                const byteArray = new Uint8Array(byteNumbers);
-                byteArrays.push(byteArray);
-            }
-            return new Blob(byteArrays, { type: mimeType });
+        // ======================================================
+        // XỬ LÝ AUDIO TTS
+        // ======================================================
+        let audioChunks = [];
+        let audioMimeType = 'audio/wav'; 
+
+        function appendAudioChunk(chunk) {
+            audioChunks.push(atob(chunk)); 
         }
 
+        function finalizeAudio() {
+            if (audioChunks.length === 0) {
+                 log('[TTS] Không nhận được audio chunks.', 'error');
+                 resetUI(true);
+                 return;
+            }
+            
+            const rawData = audioChunks.join('');
+            const buffer = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; i++) {
+                buffer[i] = rawData.charCodeAt(i);
+            }
+            
+            const blob = new Blob([buffer], { type: audioMimeType });
+            const audioUrl = URL.createObjectURL(blob);
+            
+            ttsAudio.src = audioUrl;
+            ttsAudio.play().catch(e => log(`Lỗi khi phát audio: ${e.message} (Có thể trình duyệt cần tương tác người dùng)`, 'error'));
+            
+            audioChunks = []; 
+            // KHÔNG reset UI ở đây, đợi onended để tránh ngắt tiếng phát dở
+        }
 
-        function stopRecording() {
+        // ======================================================
+        // CÁC HÀM ĐIỀU KHIỂN
+        // ======================================================
+        async function stopRecording() {
             if (pc && pc.connectionState === 'connected') {
-                log('🛑 Yêu cầu Dừng Ghi Âm và Bắt Đầu Xử Lý...', 'status');
+                updateStatus('Đang kết thúc ghi âm và gửi lệnh xử lý...', 30);
                 stopBtn.disabled = true;
+                startBtn.disabled = true; 
                 
-                // Sử dụng dataChannel đã được khởi tạo
+                // Gửi lệnh DỪNG GHI ÂM đến Backend qua Data Channel
                 if (dataChannel && dataChannel.readyState === 'open') {
                     dataChannel.send(JSON.stringify({ type: 'stop_recording' }));
-                } else {
-                     log('Data Channel chưa sẵn sàng để gửi lệnh dừng.', 'warn');
+                    log('[DataChannel] Đã gửi lệnh DỪNG GHI ÂM.');
                 }
-                
-                localStream.getTracks().forEach(track => track.stop());
-                
-                updateStatus('Đã dừng ghi âm. Đang chờ server phản hồi...', 55);
             }
         }
         
         function sendCancelMessage() {
-             if (dataChannel && dataChannel.readyState === 'open' && isProcessing) {
-                 log('❌ Gửi lệnh HỦY XỬ LÝ đến Server.', 'error');
-                 dataChannel.send(JSON.stringify({ type: 'cancel_processing' }));
-                 resetUI();
-             }
+            if (pc && pc.connectionState === 'connected' && dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify({ type: 'cancel_processing' }));
+                log('[DataChannel] Đã gửi lệnh HỦY XỬ LÝ.', 'error');
+                updateStatus('Đã hủy xử lý.', 0);
+                resetUI(true);
+                if (ttsAudio.src) { ttsAudio.pause(); ttsAudio.removeAttribute('src'); }
+            }
         }
-        
+
         // ======================================================
-        // LÔGIC KHỞI TẠO MICRO
+        // KHỞI TẠO MICROPHONE/SYSTEM AUDIO (ĐÃ SỬA ĐỔI)
         // ======================================================
-        
-        async function init() {
-            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-                try {
-                    // Chỉ khởi tạo Local Stream
-                    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    log('Truy cập Micro thành công. Sẵn sàng kết nối.', 'status');
-                    startBtn.disabled = false;
-                    stopBtn.disabled = true;
-                } catch (e) {
-                    log(`Lỗi truy cập Micro: ${e.message}`, 'error');
-                    alert("Không thể truy cập Micro. Vui lòng cấp quyền.");
+        async function initStream(force = false) {
+            const selectedSource = document.querySelector('input[name="audioSource"]:checked').value;
+
+            // Nếu stream đã tồn tại và đúng nguồn, không cần khởi tạo lại
+            if (localStream && !force) {
+                let isCorrectSource = false;
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    // Kiểm tra xem luồng hiện tại có phải là mic hay display (system audio) không
+                    const isMic = audioTrack.label.toLowerCase().includes('mic');
+                    const isDisplay = audioTrack.label.toLowerCase().includes('display') || audioTrack.label.toLowerCase().includes('system');
+                    
+                    if (selectedSource === 'mic' && isMic) isCorrectSource = true;
+                    if (selectedSource === 'system' && isDisplay) isCorrectSource = true;
                 }
-            } else {
-                log('WebRTC không được hỗ trợ trên trình duyệt này.', 'error');
-                alert("Trình duyệt không hỗ trợ WebRTC.");
+                if (isCorrectSource) {
+                    startBtn.disabled = false;
+                    return; 
+                }
+            }
+            
+            // Dừng stream cũ nếu có
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+
+            try {
+                if (selectedSource === 'mic') {
+                    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                    log('✅ Truy cập Microphone thành công.', 'status');
+                } else if (selectedSource === 'system') {
+                    // Sử dụng getDisplayMedia để lấy luồng audio hệ thống
+                    localStream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true });
+                    
+                    const audioTrack = localStream.getAudioTracks()[0];
+                    if (audioTrack) {
+                         // Lắng nghe sự kiện người dùng dừng chia sẻ màn hình/audio
+                         audioTrack.onended = () => {
+                            log('⚠️ Chia sẻ Âm thanh Hệ thống đã bị dừng bởi người dùng/trình duyệt.', 'error');
+                            if (pc && pc.connectionState !== 'closed') {
+                                stopRecording(); // Tự động dừng ghi âm
+                            }
+                        };
+                        log('✅ Truy cập Âm thanh Hệ thống thành công (Vui lòng chọn "Chia sẻ âm thanh" trong hộp thoại).', 'status');
+                    } else {
+                        log('❌ Lỗi: Không thể lấy luồng Audio từ Chia sẻ Màn hình. Hãy đảm bảo chọn "Chia sẻ âm thanh".', 'error');
+                        // Nếu không lấy được audio track, dừng stream
+                        localStream.getTracks().forEach(track => track.stop());
+                        localStream = null;
+                    }
+                }
+                
+                if (localStream && localStream.getAudioTracks().length > 0) {
+                    startBtn.disabled = false;
+                } else {
+                    startBtn.disabled = true;
+                }
+
+            } catch (e) {
+                log(`❌ Lỗi truy cập Audio (${selectedSource}): ${e.name}: ${e.message}`, 'error');
+                alert(`Không thể truy cập nguồn audio (${selectedSource}). Vui lòng cấp quyền và thử lại.`);
+                startBtn.disabled = true;
             }
         }
 
@@ -367,13 +395,17 @@
         // EVENT LISTENERS
         // ======================================================
         startBtn.addEventListener('click', async () => {
-             // Đảm bảo stream đã có
-             if (!localStream) {
-                 await init();
-             }
-             if (localStream) {
+             await initStream(true); // Khởi tạo stream một lần nữa để đảm bảo nguồn đúng
+             if (localStream && localStream.getAudioTracks().length > 0) {
                  createPeerConnection(); // Tạo PC và gọi initWebSocket bên trong
+             } else {
+                 log('❌ Vui lòng chọn nguồn Audio và cấp quyền trước khi bắt đầu.', 'error');
              }
+        });
+        
+        // Lắng nghe sự kiện thay đổi nguồn audio để khởi tạo lại stream
+        audioSourceRadios.forEach(radio => {
+            radio.addEventListener('change', () => initStream(true));
         });
         
         stopBtn.addEventListener('click', stopRecording); 
@@ -383,16 +415,15 @@
         ttsAudio.onended = () => {
              log('[TTS] Kết thúc phát audio.', 'status');
              updateStatus('Đã xử lý xong. Sẵn sàng cho phiên mới.', 100);
-             resetUI(); 
+             resetUI(true); 
         }
 
         window.onload = function() {
-            // Khôi phục/Lưu API Key
             const savedKey = localStorage.getItem('voice_ai_api_key');
             if (savedKey) {
                 apiKeyInput.value = savedKey;
             } 
-            init(); // Chỉ init Micro, KHÔNG init WebSocket
+            initStream(); // Chỉ init stream khi tải trang
         };
 
         apiKeyInput.addEventListener('change', () => {
@@ -400,6 +431,11 @@
             localStorage.setItem('voice_ai_api_key', key);
             log("API Key đã được lưu tạm thời.", 'status');
         });
+        
+        // Kiểm tra trình duyệt hỗ trợ
+        if (!navigator.mediaDevices || !RTCPeerConnection) {
+            alert("Trình duyệt không hỗ trợ WebRTC.");
+        }
 
     </script>
 </body>

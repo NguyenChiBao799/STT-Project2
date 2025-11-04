@@ -75,6 +75,7 @@ except Exception as e:
     DEVICE = "cpu"
     WHISPER_MODEL = None
     _log_colored(f"❌ [ASR] Lỗi tải Whisper/VAD: {e}. Sử dụng Mock.", "red")
+    _log_colored(traceback.format_exc(), "red") 
 
 
 # ==================== VAD HELPER (Lọc Tạp Âm) ====================
@@ -90,6 +91,7 @@ def _apply_silero_vad(audio_filepath: Path, log_callback: Callable) -> Optional[
             audio_tensor.to(DEVICE), 
             VAD_MODEL, 
             sampling_rate=SAMPLE_RATE, 
+            # ĐIỀU CHỈNH: Giảm ngưỡng về 0.3 để bắt giọng nói từ loa máy tính
             threshold=0.3 
         )
         if not speech_timestamps:
@@ -102,12 +104,18 @@ def _apply_silero_vad(audio_filepath: Path, log_callback: Callable) -> Optional[
         original_duration = len(audio_tensor) / SAMPLE_RATE
         filtered_duration = len(speech_audio_numpy) / SAMPLE_RATE
         
+        MIN_SPEECH_DURATION_SECONDS = 0.5
+        if filtered_duration < MIN_SPEECH_DURATION_SECONDS:
+             log_callback(f"⚠️ [VAD] Audio đã lọc quá ngắn ({filtered_duration:.2f}s < {MIN_SPEECH_DURATION_SECONDS}s). Coi là tạp âm.", "orange")
+             return None 
+
         log_callback(f"✅ [VAD] Lọc thành công. Gốc: {original_duration:.2f}s -> VAD: {filtered_duration:.2f}s.", "blue")
         
         return speech_audio_numpy
     
     except Exception as e:
         log_callback(f"❌ [VAD] LỖI khi áp dụng Silero VAD: {e}. Fallback về audio gốc.", "red")
+        log_callback(traceback.format_exc(), "red") 
         return whisper.load_audio(str(audio_filepath))
 
 
@@ -124,6 +132,7 @@ class ASRServiceWhisper:
         try:
             start_time = time.time()
             
+            # VAD được áp dụng trong threadpool trước khi gọi Whisper
             audio_input = await asyncio.to_thread(
                 _apply_silero_vad, audio_filepath, self._log
             )
@@ -139,7 +148,7 @@ class ASRServiceWhisper:
                 self.model.transcribe, 
                 audio_input, 
                 language="vi", 
-                fp16=USE_FP16 # SỬ DỤNG FP16
+                fp16=USE_FP16 
             )
             final_transcript = result.get("text", "").strip()
             
@@ -154,7 +163,7 @@ class ASRServiceWhisper:
              raise
         except Exception as e:
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [ASR] LỖI WHISPER: {e}", "red")
-            self._log(traceback.format_exc(), "red")
+            self._log(traceback.format_exc(), "red") 
             yield "" 
 
 class TTSServiceMock:
@@ -162,7 +171,6 @@ class TTSServiceMock:
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
         self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS MOCK] Bắt đầu tổng hợp âm thanh...", "magenta")
         mock_chunk_size = 320 
-        # Cần base64 encode byte data trước khi yield
         mock_chunk = base64.b64encode(os.urandom(mock_chunk_size)) 
         
         num_chunks = max(30, min(100, int(len(text) * 0.5) + 10)) 
@@ -202,11 +210,8 @@ class RTCStreamProcessor:
         response_text = "Xin lỗi, tôi chưa thể xử lý yêu cầu."
         
         try: 
-            # ✅ FIX #1: CƯỠNG CHẾ KHỞI TẠO GENERATOR STATE
-            # Dòng này buộc Generator phải thiết lập trạng thái hợp lệ ngay lập tức
             yield (False, {"type": "generator_init", "user_text": "", "bot_text": ""}) 
             
-            # 1. Xử lý ASR (Bao gồm VAD)
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Bắt đầu gọi ASR Service...", "yellow")
             asr_stream = self._asr_client.transcribe(record_file)
             async for partial_text in asr_stream:
@@ -215,12 +220,10 @@ class RTCStreamProcessor:
                      
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎙️ [ASR] Transcript nhận được: '{full_transcript[:50]}...'", "green")
 
-            # 2. NLU/Response Logic - TÍCH HỢP DIALOG MANAGER
             dm_input_asr = full_transcript.strip() if full_transcript.strip() else "[NO SPEECH DETECTED]"
             
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🧠 [DM] Bắt đầu xử lý DialogManager (Chuyển sang luồng phụ)...", "yellow")
             
-            # GỌI HÀM ĐỒNG BỘ CỦA DIALOG MANAGER TRONG THREADPOOL
             dm_result = await asyncio.to_thread(
                 self._dm.process_audio_file, 
                 str(record_file), 
@@ -237,7 +240,6 @@ class RTCStreamProcessor:
 
             yield (False, {"user_text": full_transcript, "bot_text": response_text})
 
-            # 3. TTS và Trả về Luồng Audio
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS] Bắt đầu streaming audio phản hồi...", "magenta")
             tts_audio_stream = self._tts_client.synthesize_stream(response_text)
             async for audio_chunk in tts_audio_stream:
@@ -246,14 +248,12 @@ class RTCStreamProcessor:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # ✅ FIX #2: PHẢI YIELD trong khối except để tránh lỗi NoneType
-            # Dòng này đảm bảo dù có lỗi, hàm vẫn gửi một tín hiệu (báo lỗi)
+            # ✅ FIX: PHẢI YIELD trong khối except để tránh lỗi NoneType khi hàm generator kết thúc không hợp lệ
             full_transcript = full_transcript if full_transcript else "[ERROR_DURING_INIT]"
             self._log(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [RTC] LỖI XỬ LÝ CHUNG: {e}", "red")
-            self._log(traceback.format_exc(), "red")
+            self._log(traceback.format_exc(), "red") 
             
             error_message = f"Lỗi xử lý. Chi tiết: {e.__class__.__name__}"
-            # Gửi thông báo lỗi về frontend
             yield (False, {"user_text": full_transcript, "bot_text": error_message}) 
 
         finally: 
