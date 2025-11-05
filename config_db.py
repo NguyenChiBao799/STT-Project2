@@ -1,7 +1,7 @@
 # config_db.py
 import os
 import uuid
-# Optional imports used for TTS-check
+
 try:
     import pyttsx3
 except Exception:
@@ -12,9 +12,10 @@ except Exception:
 # ======================================================
 class ConfigDB:
     # --- API KEYS & MODES ---
+    # API Key mặc định, sẽ được ghi đè bằng giá trị từ Frontend (WebRTC)
     API_KEY = os.environ.get("YOUR_API_KEY_ENV_VAR", "MOCK_API_KEY") 
     
-    # CHẾ ĐỘ XỬ LÝ
+    # CHẾ ĐỘ XỬ LÝ (MOCK/LLM/WHISPER/API)
     NLU_MODE_DEFAULT = "MOCK"      
     ASR_MODE_DEFAULT = "WHISPER"   
     LLM_MODE_DEFAULT = "MOCK"   
@@ -28,7 +29,7 @@ class ConfigDB:
 
     # --- CONFIG ASR/NLU ---
     WHISPER_MODEL_NAME = "small"
-    NLU_CONFIDENCE_THRESHOLD = 0.6 # ✅ HẰNG SỐ CẦN THIẾT
+    NLU_CONFIDENCE_THRESHOLD = 0.6 
     
     # --- CONFIG AUDIO IO ---
     SAMPLE_RATE = 16000 # 16kHz
@@ -37,7 +38,8 @@ class ConfigDB:
     INITIAL_STATE = "START" 
     SCENARIOS_CONFIG = { 
         "rules": [
-            {"intent": "chao_hoi", "response": "Chào bạn, tôi là trợ lý ảo. Bạn cần hỗ trợ gì?"}
+            {"intent": "chao_hoi", "responses": ["Chào bạn, tôi là trợ lý ảo. Bạn cần hỗ trợ gì?", "Xin chào! Tôi có thể giúp gì cho bạn hôm nay?"]},
+            {"intent": "no_match", "response": "Xin lỗi, tôi chưa hiểu rõ ý bạn. Bạn có thể nói rõ hơn không?"}
         ]
     }
     
@@ -49,7 +51,6 @@ class ConfigDB:
 # ======================================================
 # HẰNG SỐ DỰ ÁN (EXPORTING FOR DIRECT IMPORT)
 # ======================================================
-# Sử dụng ConfigDB để export TẤT CẢ các hằng số cần thiết
 API_KEY = ConfigDB.API_KEY 
 GEMINI_MODEL = ConfigDB.GEMINI_MODEL
 LLM_MODE_DEFAULT = ConfigDB.LLM_MODE_DEFAULT 
@@ -59,15 +60,9 @@ ASR_MODE_DEFAULT = ConfigDB.ASR_MODE_DEFAULT
 TTS_MODE_DEFAULT = ConfigDB.TTS_MODE_DEFAULT
 TTS_VOICE_NAME_DEFAULT = ConfigDB.TTS_VOICE_NAME_DEFAULT
 
-# ✅ FIX LỖI: Export NLU_CONFIDENCE_THRESHOLD
 NLU_CONFIDENCE_THRESHOLD = ConfigDB.NLU_CONFIDENCE_THRESHOLD
+WHISPER_MODEL_NAME = ConfigDB.WHISPER_MODEL_NAME
+SAMPLE_RATE = ConfigDB.SAMPLE_RATE
 
 SCENARIOS_CONFIG = ConfigDB.SCENARIOS_CONFIG
-STATE_CONFIG = ConfigDB.STATE_CONFIG
-PRIORITY_RULES = ConfigDB.PRIORITY_RULES
-INITIAL_STATE = ConfigDB.INITIAL_STATE 
-
-# Lists for UI
-LLM_MODES = ["API", "MOCK"]
-NLU_MODES = ["LLM", "LOCAL", "MOCK"]
-DB_MODES = ["CORPORATE_..."]
+INITIAL_STATE = ConfigDB.INITIAL_STATE
