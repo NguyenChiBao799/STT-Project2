@@ -9,7 +9,8 @@
         .control-panel { display: flex; justify-content: space-around; margin-top: 20px; }
         button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; transition: background-color 0.3s; }
         #startBtn { background-color: #28a745; color: white; }
-        #startBtn:hover { background-color: #218838; }
+        #startBtn:disabled { background-color: #90ee90; cursor: not-allowed; }
+        #startBtn:hover:not(:disabled) { background-color: #218838; }
         #stopBtn, #cancelBtn { background-color: #dc3545; color: white; }
         #stopBtn:hover, #cancelBtn:hover { background-color: #c82333; }
         #cancelBtn { display: none; }
@@ -43,7 +44,7 @@
         </div>
 
         <div class="control-panel">
-            <button id="startBtn">▶️ Bắt Đầu Ghi Âm</button>
+            <button id="startBtn" disabled>▶️ Bắt Đầu Ghi Âm</button>
             <button id="stopBtn" disabled>⏹️ Dừng & Xử Lý</button>
             <button id="cancelBtn">❌ Hủy Xử Lý</button>
         </div>
@@ -85,6 +86,8 @@
         let localStream = null;
         let sessionId = null;
         let ws = null;
+        // Cờ theo dõi việc đã cố gắng lấy quyền Audio hay chưa
+        let isPermissionAttempted = false; 
 
         // ======================================================
         // CÁC HÀM TIỆN ÍCH
@@ -100,7 +103,8 @@
         }
 
         function resetUI(fullReset = false) {
-            startBtn.disabled = false;
+            // Cập nhật trạng thái nút Start dựa trên việc đã có quyền và stream hay chưa
+            startBtn.disabled = !isPermissionAttempted || !localStream || localStream.getAudioTracks().length === 0;
             stopBtn.disabled = true;
             cancelBtn.style.display = 'none';
             if (fullReset) {
@@ -149,6 +153,7 @@
             if (!localStream || localStream.getAudioTracks().length === 0) {
                  log('❌ Không có luồng audio hợp lệ để bắt đầu.', 'error');
                  alert('Không có luồng audio hợp lệ để bắt đầu ghi âm. Vui lòng cấp quyền Microphone hoặc chọn Âm thanh Hệ thống.');
+                 resetUI(true);
                  return;
             }
 
@@ -211,7 +216,8 @@
                     body: JSON.stringify({
                         sdp: pc.localDescription.sdp,
                         type: pc.localDescription.type,
-                        session_id: sessionId
+                        session_id: sessionId,
+                        api_key: apiKeyInput.value.trim() 
                     })
                 });
                 
@@ -225,9 +231,37 @@
                 log(`Lỗi Signalling/Offer: ${e.message}`, 'error');
                 updateStatus('❌ Lỗi kết nối Server.', 0);
                 try { await pc.close(); } catch {}
+                resetUI(true);
             }
         }
         
+        function playFinalAudio(audioPath) {
+            if (!audioPath) {
+                 log('[TTS] ❌ Không có đường dẫn audio phản hồi.', 'error');
+                 resetUI(true);
+                 return;
+            }
+            
+            ttsAudio.src = audioPath;
+            ttsAudio.load(); 
+
+            // FIX LỖI AUTOPLAY: Sử dụng PlayPromise
+            const playPromise = ttsAudio.play();
+            
+            if (playPromise !== undefined) {
+                playPromise.then(_ => {
+                    log('[TTS] ✅ Đang phát audio phản hồi...', 'status');
+                }).catch(e => {
+                    log(`❌ Lỗi khi phát audio: ${e.message}. Trình duyệt đã chặn Autoplay. Vui lòng nhấp chuột vào trang trước khi thử lại.`, 'error');
+                    updateStatus('❌ Bị chặn phát. Sẵn sàng cho phiên mới.', 100);
+                    resetUI(true); 
+                });
+            } else {
+                 log('[TTS] ✅ Đang phát audio phản hồi (Không có PlayPromise)...', 'status');
+            }
+        }
+
+
         function handleDataChannelMessage(event) {
             try {
                 const data = JSON.parse(event.data);
@@ -239,17 +273,22 @@
                     ttsAudio.removeAttribute('src');
                     ttsAudio.pause();
 
-                } else if (data.type === 'text_response') {
+                // 🚨 Sửa: Nhận kết quả ASR/NLU sớm (partial)
+                } else if (data.type === 'text_response_partial') {
                     updateStatus('🎵 Server đang Tổng hợp TTS...', 70);
                     textOutputDiv.querySelector('.user-text').innerHTML = `<strong>Người dùng:</strong> ${data.user_text || 'Không nhận diện được giọng nói.'}`;
                     textOutputDiv.querySelector('.bot-text').innerHTML = `<strong>Bot:</strong> ${data.bot_text}`;
 
-                } else if (data.type === 'audio_chunk') {
-                    appendAudioChunk(data.chunk);
-
+                // 🚨 Sửa: Nhận tín hiệu kết thúc và đường dẫn file
                 } else if (data.type === 'end_of_session') {
                     updateStatus('✅ Xử lý hoàn tất. Đang phát audio...', 100);
-                    finalizeAudio();
+                    if (data.bot_audio_path) {
+                        log(`[TTS] Đã nhận đường dẫn file: ${data.bot_audio_path}`);
+                        playFinalAudio(data.bot_audio_path); // Chơi file từ đường dẫn
+                    } else {
+                         log('[TTS] ⚠️ Hoàn tất phiên nhưng không có file audio phản hồi.', 'warning');
+                         resetUI(true);
+                    }
                     
                 } else if (data.type === 'error') {
                     log(`LỖI XỬ LÝ SERVER: ${data.error}`, 'error');
@@ -263,37 +302,11 @@
         }
         
         // ======================================================
-        // XỬ LÝ AUDIO TTS
+        // XỬ LÝ AUDIO TTS (ĐÃ SỬA LỖI LOẠI BỎ CHUNKS VÀ DÙNG FILE)
         // ======================================================
-        let audioChunks = [];
-        let audioMimeType = 'audio/wav'; 
+        // 🚨 ĐÃ XÓA: audioChunks, audioMimeType, appendAudioChunk, finalizeAudio.
+        // Logic đã được chuyển vào playFinalAudio()
 
-        function appendAudioChunk(chunk) {
-            audioChunks.push(atob(chunk)); 
-        }
-
-        function finalizeAudio() {
-            if (audioChunks.length === 0) {
-                 log('[TTS] Không nhận được audio chunks.', 'error');
-                 resetUI(true);
-                 return;
-            }
-            
-            const rawData = audioChunks.join('');
-            const buffer = new Uint8Array(rawData.length);
-            for (let i = 0; i < rawData.length; i++) {
-                buffer[i] = rawData.charCodeAt(i);
-            }
-            
-            const blob = new Blob([buffer], { type: audioMimeType });
-            const audioUrl = URL.createObjectURL(blob);
-            
-            ttsAudio.src = audioUrl;
-            ttsAudio.play().catch(e => log(`Lỗi khi phát audio: ${e.message} (Có thể trình duyệt cần tương tác người dùng)`, 'error'));
-            
-            audioChunks = []; 
-            // KHÔNG reset UI ở đây, đợi onended để tránh ngắt tiếng phát dở
-        }
 
         // ======================================================
         // CÁC HÀM ĐIỀU KHIỂN
@@ -317,13 +330,19 @@
                 dataChannel.send(JSON.stringify({ type: 'cancel_processing' }));
                 log('[DataChannel] Đã gửi lệnh HỦY XỬ LÝ.', 'error');
                 updateStatus('Đã hủy xử lý.', 0);
+                
+                // 🚨 Sửa: Không cần revokeObjectURL vì là file tĩnh
+                if (ttsAudio.src) { 
+                    ttsAudio.pause(); 
+                    ttsAudio.removeAttribute('src'); 
+                }
+                
                 resetUI(true);
-                if (ttsAudio.src) { ttsAudio.pause(); ttsAudio.removeAttribute('src'); }
             }
         }
 
         // ======================================================
-        // KHỞI TẠO MICROPHONE/SYSTEM AUDIO (ĐÃ SỬA ĐỔI)
+        // KHỞI TẠO MICROPHONE/SYSTEM AUDIO (TRẢ VỀ BOOLEAN)
         // ======================================================
         async function initStream(force = false) {
             const selectedSource = document.querySelector('input[name="audioSource"]:checked').value;
@@ -333,7 +352,6 @@
                 let isCorrectSource = false;
                 const audioTrack = localStream.getAudioTracks()[0];
                 if (audioTrack) {
-                    // Kiểm tra xem luồng hiện tại có phải là mic hay display (system audio) không
                     const isMic = audioTrack.label.toLowerCase().includes('mic');
                     const isDisplay = audioTrack.label.toLowerCase().includes('display') || audioTrack.label.toLowerCase().includes('system');
                     
@@ -341,12 +359,11 @@
                     if (selectedSource === 'system' && isDisplay) isCorrectSource = true;
                 }
                 if (isCorrectSource) {
-                    startBtn.disabled = false;
-                    return; 
+                    isPermissionAttempted = true; 
+                    return true;
                 }
             }
             
-            // Dừng stream cũ nếu có
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());
                 localStream = null;
@@ -357,37 +374,59 @@
                     localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
                     log('✅ Truy cập Microphone thành công.', 'status');
                 } else if (selectedSource === 'system') {
-                    // Sử dụng getDisplayMedia để lấy luồng audio hệ thống
                     localStream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true });
                     
                     const audioTrack = localStream.getAudioTracks()[0];
                     if (audioTrack) {
-                         // Lắng nghe sự kiện người dùng dừng chia sẻ màn hình/audio
                          audioTrack.onended = () => {
                             log('⚠️ Chia sẻ Âm thanh Hệ thống đã bị dừng bởi người dùng/trình duyệt.', 'error');
                             if (pc && pc.connectionState !== 'closed') {
-                                stopRecording(); // Tự động dừng ghi âm
+                                stopRecording(); 
                             }
                         };
                         log('✅ Truy cập Âm thanh Hệ thống thành công (Vui lòng chọn "Chia sẻ âm thanh" trong hộp thoại).', 'status');
                     } else {
                         log('❌ Lỗi: Không thể lấy luồng Audio từ Chia sẻ Màn hình. Hãy đảm bảo chọn "Chia sẻ âm thanh".', 'error');
-                        // Nếu không lấy được audio track, dừng stream
                         localStream.getTracks().forEach(track => track.stop());
                         localStream = null;
                     }
                 }
                 
-                if (localStream && localStream.getAudioTracks().length > 0) {
-                    startBtn.disabled = false;
-                } else {
-                    startBtn.disabled = true;
-                }
+                isPermissionAttempted = true;
+                return localStream && localStream.getAudioTracks().length > 0;
 
             } catch (e) {
                 log(`❌ Lỗi truy cập Audio (${selectedSource}): ${e.name}: ${e.message}`, 'error');
-                alert(`Không thể truy cập nguồn audio (${selectedSource}). Vui lòng cấp quyền và thử lại.`);
+                isPermissionAttempted = true; 
+                return false;
+            }
+        }
+        
+        // Hàm xử lý tương tác đầu tiên để yêu cầu quyền
+        async function requestPermissionOnFirstInteraction() {
+            // Loại bỏ Listener để chỉ chạy một lần duy nhất
+            document.body.removeEventListener('click', requestPermissionOnFirstInteraction);
+            document.body.removeEventListener('touchstart', requestPermissionOnFirstInteraction);
+            
+            await handlePermissionRequest();
+        }
+        
+        // Logic request quyền độc lập
+        async function handlePermissionRequest() {
+            // Nếu đã có stream, không cần yêu cầu lại
+            if (localStream && localStream.getAudioTracks().length > 0) return true;
+
+            updateStatus('Đang yêu cầu cấp quyền Audio...', 0);
+            const success = await initStream(true); 
+            
+            if (success) {
+                updateStatus('✅ Quyền Audio đã được cấp. Sẵn sàng bắt đầu.', 0);
+                startBtn.disabled = false;
+                return true;
+            } else {
+                updateStatus('⚠️ Lỗi/Từ chối cấp quyền Audio. Vui lòng nhấp lại START.', 0);
                 startBtn.disabled = true;
+                return false;
             }
         }
 
@@ -395,17 +434,26 @@
         // EVENT LISTENERS
         // ======================================================
         startBtn.addEventListener('click', async () => {
-             await initStream(true); // Khởi tạo stream một lần nữa để đảm bảo nguồn đúng
-             if (localStream && localStream.getAudioTracks().length > 0) {
-                 createPeerConnection(); // Tạo PC và gọi initWebSocket bên trong
-             } else {
-                 log('❌ Vui lòng chọn nguồn Audio và cấp quyền trước khi bắt đầu.', 'error');
+             // 1. Nếu chưa có stream (chưa cấp quyền), yêu cầu quyền trước
+             if (!localStream || localStream.getAudioTracks().length === 0) {
+                 const success = await handlePermissionRequest();
+                 if (!success) {
+                     log('❌ Không thể bắt đầu do không có quyền Audio.', 'error');
+                     return;
+                 }
              }
+             
+             // 2. Bắt đầu Peer Connection
+             createPeerConnection(); 
         });
         
-        // Lắng nghe sự kiện thay đổi nguồn audio để khởi tạo lại stream
         audioSourceRadios.forEach(radio => {
-            radio.addEventListener('change', () => initStream(true));
+            radio.addEventListener('change', () => {
+                 // Nếu đã có quyền, initStream lại để chuyển nguồn.
+                if (isPermissionAttempted) {
+                    handlePermissionRequest(); 
+                }
+            });
         });
         
         stopBtn.addEventListener('click', stopRecording); 
@@ -415,15 +463,39 @@
         ttsAudio.onended = () => {
              log('[TTS] Kết thúc phát audio.', 'status');
              updateStatus('Đã xử lý xong. Sẵn sàng cho phiên mới.', 100);
+             
+             // 🚨 Sửa: Không cần revokeObjectURL
+             ttsAudio.removeAttribute('src'); 
+             
              resetUI(true); 
         }
+        
+        ttsAudio.onerror = (e) => {
+             // Lỗi này bắt lỗi Failed to load because no supported source was found.
+             log(`❌ Lỗi tải audio (Code: ${e.target.error.code}): URL audio có thể không hợp lệ.`, 'error');
+             
+             // 🚨 Sửa: Không cần revokeObjectURL
+             ttsAudio.removeAttribute('src'); 
+
+             updateStatus('❌ Lỗi tải audio phản hồi.', 0);
+             resetUI(true);
+        }
+
 
         window.onload = function() {
+            // Load API Key
             const savedKey = localStorage.getItem('voice_ai_api_key');
             if (savedKey) {
                 apiKeyInput.value = savedKey;
             } 
-            initStream(); // Chỉ init stream khi tải trang
+            
+            // Thiết lập Listener cho tương tác đầu tiên
+            document.body.addEventListener('click', requestPermissionOnFirstInteraction, { once: true });
+            document.body.addEventListener('touchstart', requestPermissionOnFirstInteraction, { once: true });
+            
+            // Trạng thái chờ tương tác
+            startBtn.disabled = true;
+            updateStatus('Vui lòng nhấp vào bất kỳ đâu trên trang hoặc nút START để cấp quyền Audio...');
         };
 
         apiKeyInput.addEventListener('change', () => {
@@ -432,7 +504,6 @@
             log("API Key đã được lưu tạm thời.", 'status');
         });
         
-        // Kiểm tra trình duyệt hỗ trợ
         if (!navigator.mediaDevices || !RTCPeerConnection) {
             alert("Trình duyệt không hỗ trợ WebRTC.");
         }

@@ -12,6 +12,18 @@ import base64
 import httpx 
 import whisper # Cần cài đặt thư viện Whisper
 from concurrent.futures import ThreadPoolExecutor
+# Thêm import cho GTTS và chuyển đổi audio
+import io 
+import wave
+try:
+    from gtts import gTTS
+    from pydub import AudioSegment 
+    GTTS_IS_READY = True
+except ImportError:
+    gTTS = None 
+    AudioSegment = None
+    GTTS_IS_READY = False
+
 
 # --- Cấu hình API Nội bộ ---
 INTERNAL_UPLOAD_URL = "http://internal.company.api/v1/voice_logs/upload" 
@@ -126,23 +138,92 @@ async def _upload_audio_to_internal_api(file_path: Path, session_id: str, log_ca
         log_callback(f"[{_dt.now().strftime('%H:%M:%S')}] ❌ [UPLOAD] LỖI UPLOAD: {e}", "red")
         return False
 
-# ==================== DỊCH VỤ TTS (Mock Streaming) ====================
+# ==================== DỊCH VỤ TTS (GTTS Streaming) ====================
 
-class TTSServiceMock:
-    """Mock TTS tạo chunk base64 để streaming."""
-    def __init__(self, log_callback: Callable): self._log = log_callback
-    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS MOCK] Bắt đầu tổng hợp âm thanh...", "magenta")
-        # Giả lập chunk audio 10ms (16000 sample/s * 2 bytes/sample * 1 kênh * 0.01s = 320 bytes)
-        mock_chunk_size = 320 
-        num_chunks = max(30, min(100, int(len(text) * 0.5) + 10)) 
+class TTSServiceGTTS:
+    """Sử dụng thư viện gTTS để tạo audio MP3 và chuyển đổi sang PCM 16kHz để streaming."""
+    
+    TTS_LANG: ClassVar[str] = "vi" 
+    
+    def __init__(self, log_callback: Callable): 
+        self._log = log_callback
+        self._is_ready = GTTS_IS_READY
         
-        for _ in range(num_chunks):
-            # Giả lập Base64 encoded chunk
-            mock_chunk = base64.b64encode(os.urandom(mock_chunk_size)) 
-            yield mock_chunk 
-            await asyncio.sleep(0.005) # Giả lập độ trễ streaming
-        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS MOCK] Kết thúc luồng audio TTS.", "magenta")
+        if not self._is_ready:
+            self._log("⚠️ [TTS] Thư viện gTTS hoặc pydub không sẵn sàng. Sẽ dùng Fallback Mock.", "orange")
+        else:
+            self._log("✅ [TTS] Dịch vụ gTTS sẵn sàng.", "green")
+
+    def _synthesize_blocking(self, text: str) -> Optional[bytes]:
+        """Hàm đồng bộ (Blocking) để gọi gTTS, tạo MP3, và chuyển đổi sang WAV/PCM 16kHz."""
+        if not self._is_ready:
+             return None 
+             
+        self._log(f"🧠 [GTTS] Bắt đầu tổng hợp văn bản: '{text[:30]}...'", "magenta")
+        
+        try:
+            # 1. Tạo audio MP3 bằng gTTS (output stream)
+            tts = gTTS(text=text, lang=self.TTS_LANG)
+            mp3_buffer = io.BytesIO()
+            tts.write_to_fp(mp3_buffer)
+            mp3_buffer.seek(0)
+            
+            # 2. Tải MP3 và chuyển đổi sang PCM 16kHz, 16-bit, Mono (Dùng pydub, cần FFmpeg)
+            audio = AudioSegment.from_file(mp3_buffer, format="mp3")
+            
+            # Áp dụng các thay đổi cần thiết cho WebRTC:
+            audio = audio.set_channels(1) # Mono
+            audio = audio.set_frame_rate(SAMPLE_RATE) # 16000 Hz
+            audio = audio.set_sample_width(2) # 16-bit (2 bytes)
+            
+            # 3. Ghi AudioSegment sang định dạng WAV để dễ dàng trích xuất PCM
+            pcm_buffer = io.BytesIO()
+            audio.export(pcm_buffer, format="wav") 
+            
+            # Trả về toàn bộ nội dung WAV (bao gồm header 44 bytes)
+            wav_data = pcm_buffer.getvalue()
+            
+            self._log(f"🎵 [GTTS] Đã tạo và chuyển đổi audio WAV/PCM {len(wav_data)} bytes.", "magenta")
+            return wav_data
+
+        except Exception as e:
+            self._log(f"❌ [GTTS] Lỗi khi tạo/chuyển đổi audio gTTS (Kiểm tra FFmpeg/Pydub): {e}", "red")
+            self._log(traceback.format_exc(), "red") 
+            return None
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS] Bắt đầu tổng hợp âm thanh...", "magenta")
+        
+        # Chạy tác vụ blocking trong Thread Pool
+        audio_data_bytes = await asyncio.get_event_loop().run_in_executor(
+            None, 
+            self._synthesize_blocking,
+            text
+        )
+        
+        if audio_data_bytes is None or len(audio_data_bytes) <= 44:
+             # Fallback Mock: 2 giây PCM 16kHz (32000 bytes)
+             self._log("⚠️ [TTS MOCK] Mô hình gTTS lỗi. Sử dụng audio chunk giả lập (Base64 random).", "orange")
+             audio_data_bytes = os.urandom(32000) 
+             PCM_DATA_OFFSET = 0 # Nếu là mock, không cần offset
+        else:
+             PCM_DATA_OFFSET = 44 # Nếu là WAV, bỏ qua 44 byte WAV header
+             
+        # 2. CHIA CHUNK VÀ STREAM (Bất đồng bộ)
+        CHUNK_SIZE_BYTES = 1600 
+        
+        streamable_data = audio_data_bytes[PCM_DATA_OFFSET:]
+        
+        for i in range(0, len(streamable_data), CHUNK_SIZE_BYTES):
+            chunk = streamable_data[i:i + CHUNK_SIZE_BYTES]
+            if not chunk: continue
+            
+            base64_chunk = base64.b64encode(chunk) 
+            yield base64_chunk
+            
+            await asyncio.sleep(0.01) # Giả lập độ trễ streaming (10ms)
+            
+        self._log(f"[{_dt.now().strftime('%H:%M:%S')}] 🎵 [TTS] Kết thúc luồng audio TTS.", "magenta")
 
 # ==================== LỚP XỬ LÝ RTC TÍCH HỢP MỚI (Đã sửa đổi) ====================
 
@@ -152,7 +233,10 @@ class RTCStreamProcessor:
         # Đảm bảo sử dụng _log
         self._log = log_callback if log_callback else _log_colored
         self._asr_client = ASRServiceWhisper(self._log, WHISPER_MODEL) if WHISPER_IS_READY else type('ASRMock', (object,), {'transcribe': lambda self, fp: (yield "Transcript giả lập.")})()
-        self._tts_client = TTSServiceMock(self._log)
+        
+        # ✅ SỬ DỤNG TTSServiceGTTS
+        self._tts_client = TTSServiceGTTS(self._log)
+        
         # Sử dụng ThreadPoolExecutor để chạy các tác vụ đồng bộ (DM)
         self._executor = ThreadPoolExecutor(max_workers=1)
     
